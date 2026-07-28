@@ -261,16 +261,22 @@ def test_3d_families_are_forced_through_and_report_what_was_done(cct_registered,
     """★ The forced tier is not skipped: 3D curves are rotated, inverted, fitted.
 
     ``rotation_applied`` records the global rotation that makes r_dot(0) = +z, a
-    physical prerequisite rather than a repair; the after-projection robustness
-    values are None because reconstructing r(t) from (a, b) needs the propagator
-    of Step 11.
+    physical prerequisite rather than a repair. The after-projection robustness
+    values were None until Step 11: rebuilding r(t) from (a, b) needs the SU(2)
+    propagator, and now that it exists they are populated (see
+    tests/test_propagate.py for what they turn out to be).
     """
     rep = ansatz.project_named(family, M=12, T=1.0)
     assert rep.coeffs_a.size == rep.coeffs_b.size == 12
     assert np.isfinite(rep.rel_rms)
     assert "rotation_applied" in rep.metadata
-    assert rep.closure_after is None and rep.area_after is None
+    assert rep.closure_after is not None and rep.area_after is not None
+    assert np.isfinite(rep.closure_after) and np.isfinite(rep.area_after)
     assert rep.closure_before >= 0.0
+    # and the gate angle now comes from the propagator, not from int Omega_x dt
+    assert rep.theta_before == pytest.approx(
+        float(ansatz.source(family).metadata["cct_rotation_angle"]), abs=5e-4
+    )
 
 
 @requires_cct

@@ -45,10 +45,10 @@ number in its row should be read as a distance to an unrelated target.
 | `flora_petal` | +7.864803 | 1 | 1.56e+00 | **off-branch** |
 | `tilted_lemniscate` | +0.000000 | 0 | 3.14e+00 | **off-branch** |
 | `treble_clef_loop` | -3.141593 | -1 | 2.39e-07 | yes |
-| `alpha_3d` | +12.425196 | 1 | 3.00e+00 | **off-branch** |
-| `zeng_clifford_3d` | +4.961426 | 0 | 1.82e+00 | **off-branch** |
-| `lissajous_3d` | -0.872950 | -1 | 2.27e+00 | **off-branch** |
-| `helix` | +1.693940 | 0 | 1.45e+00 | **off-branch** |
+| `alpha_3d` | +0.001215 | 0 | 3.14e+00 | **off-branch** |
+| `zeng_clifford_3d` | +4.188303 | 0 | 1.05e+00 | **off-branch** |
+| `lissajous_3d` | +5.890763 | 0 | 2.75e+00 | **off-branch** |
+| `helix` | +1.771600 | 0 | 1.37e+00 | **off-branch** |
 
 ## 3. Robustness conditions: as it arrives, after projection, after a gate fix
 
@@ -71,10 +71,10 @@ rebuilding r(t) from (a, b) needs it.
 | `flora_petal` | 7.62e-08 | 3.95e-06 | 1.65e-01 | -4.512e-03 | -4.513e-03 | +3.324e-02 |
 | `tilted_lemniscate` | 1.57e-07 | 2.35e-04 | 2.62e-01 | +7.866e-16 | +7.226e-16 | +8.228e-02 |
 | `treble_clef_loop` | 1.48e-07 | 1.07e-02 | 2.43e-02 | +3.904e-02 | +4.204e-02 | +4.532e-02 |
-| `alpha_3d` | 4.95e-17 | n/a | n/a | +5.473e-09 | n/a | n/a |
-| `zeng_clifford_3d` | 7.75e-17 | n/a | n/a | +8.108e-02 | n/a | n/a |
-| `lissajous_3d` | 8.17e-18 | n/a | n/a | +5.773e-09 | n/a | n/a |
-| `helix` | 8.72e-01 | n/a | n/a | +2.528e-01 | n/a | n/a |
+| `alpha_3d` | 4.95e-17 | 2.21e-02 | n/a | +5.473e-09 | +1.655e-02 | n/a |
+| `zeng_clifford_3d` | 7.75e-17 | 8.09e-03 | n/a | +8.108e-02 | +8.205e-02 | n/a |
+| `lissajous_3d` | 8.17e-18 | 3.99e-02 | n/a | +5.773e-09 | +1.366e-02 | n/a |
+| `helix` | 8.72e-01 | 8.72e-01 | n/a | +2.528e-01 | +2.528e-01 | n/a |
 
 ## 4. Cost of the projected ansatz
 
@@ -100,7 +100,7 @@ the wrong bound is the easiest way to read a violation that is not there.
 | `flora_petal` | 212.2197 | 61.6057 | 240.3897 | 11.6316 | 25.9130 |
 | `tilted_lemniscate` | 128.1813 | 0.0000 | 138.3951 | 7.8944 | 23.3746 |
 | `treble_clef_loop` | 352.5386 | 11.3841 | 350.9713 | 14.5245 | 43.8392 |
-| `alpha_3d` | 373.0515 | 138.1844 | n/a | 15.8097 | 37.9325 |
-| `zeng_clifford_3d` | 107.9459 | 24.1016 | n/a | 7.3541 | 27.2173 |
-| `lissajous_3d` | 247.0513 | 6.4550 | n/a | 12.1530 | 34.8729 |
-| `helix` | 3.1315 | 2.6849 | n/a | 1.7398 | 2.1252 |
+| `alpha_3d` | 373.0515 | 0.3982 | n/a | 15.8097 | 37.9325 |
+| `zeng_clifford_3d` | 107.9459 | 17.2532 | n/a | 7.3541 | 27.2173 |
+| `lissajous_3d` | 247.0513 | 21.0888 | n/a | 12.1530 | 34.8729 |
+| `helix` | 3.1315 | 2.9372 | n/a | 1.7398 | 2.1252 |
