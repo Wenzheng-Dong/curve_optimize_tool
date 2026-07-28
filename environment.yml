@@ -1,0 +1,27 @@
+# Conda environment for curve-opt-tool. Name is fixed: `curve`.
+#
+#   conda env create -f environment.yml      # first time
+#   conda env update -f environment.yml      # sync an existing `curve`
+#   conda activate curve
+#
+# Versions below are the ones actually verified on 2026-07-28 (Step 02).
+# Everything except the interpreter comes from pip in this env -- do not
+# "fix" that by moving packages to conda-forge without re-verifying, the
+# jax 0.4.38 / numpy 2.4.6 combination is what all step00 numbers ran on.
+#
+# Deliberately absent: diffrax, equinox, jaxopt (not installed, not used).
+name: curve
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11.13
+  - pip
+  - pip:
+      - numpy==2.4.6
+      - scipy==1.17.1
+      - jax==0.4.38
+      - jaxlib==0.4.38
+      - qutip==5.3.0
+      - matplotlib==3.11.1
+      - optax==0.2.5
+      - pytest==9.1.1
