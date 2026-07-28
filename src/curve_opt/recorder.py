@@ -22,9 +22,12 @@ Layout -- ``<RUNS_DIR>/<run_id>/`` (git-ignored local asset)
   missing any key of :data:`REQUIRED_MANIFEST_KEYS`. run_id, timestamp, git
   commit, branch; ansatz (name, source, original parameters, representability
   tier, projection protocol); M, T, target gate (name + matrix), N_grid;
-  ``winding_branch`` (the numerical value of theta -- the gate name alone does
-  not define the problem, since theta and theta + 2 pi are the same gate but have
-  lower bounds differing by theta^2); objective (terms, lambda or
+  ``winding_branch`` (the **exact** branch value ``theta_target + 2 pi k`` -- the
+  gate name alone does not define the problem, since theta and theta + 2 pi are
+  the same gate but have lower bounds differing by theta^2; the ansatz's own
+  *measured* turning is a separate field, ``theta_before``, because the constraint
+  right-hand side must not carry the error the run is meant to remove);
+  objective (terms, lambda or
   epsilon-constraint value, epigraph flag); solver (method, maxiter, GN Hessian
   on/off, tol, checkpoint_every); ``stop_reason`` in
   :data:`STOP_REASONS` -- a ``maxiter`` run is void by default.
@@ -297,7 +300,14 @@ class Recorder:
                     "step0_rel_rms": float(report.rel_rms),
                 }
             )
-        self.manifest["winding_branch"] = float(report.winding_branch)
+        # ★ The measured total turning goes to ``theta_before``; ``winding_branch``
+        # is NOT touched. Under the v4.2 semantics of §5.1 the branch value is the
+        # *exact* theta_target + 2 pi k that the gate constraint uses, while the
+        # quadrature estimate of the ansatz's own turning is a separate field.
+        # Overwriting winding_branch here (as this method did before Step 08) would
+        # record the ansatz's gate error as the target -- for rcp_lemniscate that is
+        # 2.2e-4, precisely the error the optimization exists to remove.
+        self.manifest["theta_before"] = float(report.winding_branch)
         self._write_manifest()
 
     def append(
