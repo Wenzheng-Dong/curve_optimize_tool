@@ -255,7 +255,7 @@ def closure_invariant(a, T: float, N: int = N_DEFAULT) -> float:
 def area_invariant(a, T: float, N: int = N_DEFAULT) -> float:
     """Signed ``area_x / L^2`` with ``L = T`` -- the planar reporting form.
 
-    Signed on purpose: the naive baseline gives +0.295, rcp gives -3.3e-3, and
+    Signed on purpose: the naive baseline gives -0.295, rcp gives -3.3e-3, and
     collapsing that to a magnitude would throw away the orientation.
     """
     return float(area(a, T, N)[0] / T**2)
