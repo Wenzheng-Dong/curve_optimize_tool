@@ -407,3 +407,31 @@ def test_tier_mismatch_is_reported_not_hidden(cct_registered):
     assert rep.tier_measured == "approx"
     assert rep.tier_mismatch is True
     assert rep.endpoint_ratio < ansatz.FORCED_THRESHOLD
+
+
+def test_circle_arc_projects_parallel_to_the_gate_row():
+    """★ The circle carries no information beyond its gate angle.
+
+    A constant curvature has sine coefficients ``4C / (n pi)`` on odd harmonics,
+    and the gate row is ``g_n = 2T / (n pi)`` on the same harmonics -- strictly
+    proportional. So the least-squares projection of ``circle_arc`` is exactly
+    parallel to ``g``, and an exact gate fix turns it into the gate-only
+    minimum-norm solution itself.
+
+    Consequence for the ansatz-comparison study: circle_arc is not an independent
+    "bad ansatz". Despite its forced tier and 18% projection error it is the
+    min-norm solution in disguise, which is what any conclusion drawn from it has
+    to say (see results/curve_family_audit).
+    """
+    T, M = 1.0, 12
+    a = ansatz.project_named("circle_arc", M=M, T=T, theta=np.pi).coeffs_a
+    g = basis.gate_row(M, T)
+    cos_angle = float(a @ g / np.linalg.norm(a) / np.linalg.norm(g))
+    assert cos_angle == pytest.approx(1.0, abs=1e-14)
+    assert np.max(np.abs(a[1::2])) < 1e-14  # even harmonics are absent
+
+    fixed = a + (np.pi - g @ a) * g / (g @ g)
+    assert np.allclose(fixed, basis.min_norm_gate_only(np.pi, T, M), atol=1e-7)
+    assert basis.energy_invariant(fixed, T) == pytest.approx(
+        basis.energy_bound_truncated(np.pi, M), rel=1e-12
+    )
