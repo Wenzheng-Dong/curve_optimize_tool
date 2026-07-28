@@ -78,9 +78,11 @@ from curve_opt import basis
 
 __all__ = [
     "Chain",
+    "PositionInvariants",
     "area",
     "area_invariant",
     "chain",
+    "invariants_of_positions",
     "closure",
     "closure_invariant",
     "curve",
@@ -276,3 +278,53 @@ def equality_residuals(a, T: float, N: int = N_DEFAULT):
     """
     c = _chain_of_coeffs(a, T, N)
     return jnp.array([c.closure[1] / T, c.closure[2] / T, c.area[0] / T**2])
+
+
+class PositionInvariants(NamedTuple):
+    """Robustness invariants read off a sampled space curve directly.
+
+    ``closure`` and ``area`` are the full 3-vectors; ``closure_invariant`` is
+    ``|r(T) - r(0)| / L`` and ``area_invariant`` is ``|area| / L^2`` (a norm, not
+    a signed component, because a general 3D curve has no privileged component).
+    """
+
+    L: float
+    closure: np.ndarray
+    area: np.ndarray
+    closure_invariant: float
+    area_invariant: float
+
+
+def invariants_of_positions(times, positions) -> PositionInvariants:
+    """Closure and area of a curve given as samples, without any control field.
+
+    Needed for ansatz intake (Step 06): the *original* ansatz of a 3D family is a
+    space curve, and its robustness properties must be reported before anything
+    is projected. Going through the coefficients instead would require the SU(2)
+    propagator, which is Step 11 -- but the curve is already there, so the two
+    integrals can be read off it.
+
+    Same convention as the rest of this module (``area = int r x r_dot dt``,
+    ``L`` = arc length), evaluated with :func:`numpy.trapezoid` on the given
+    sampling rather than on a midpoint grid, since the samples are what the
+    upstream family provides. For a curve reparametrized by arc length,
+    ``L = times[-1]``.
+    """
+    times = np.asarray(times, dtype=float)
+    positions = np.asarray(positions, dtype=float)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError(f"positions must have shape (K, 3), got {positions.shape}")
+    if times.shape[0] != positions.shape[0]:
+        raise ValueError("times and positions must have the same length")
+
+    velocities = np.gradient(positions, times, axis=0)
+    L = float(np.trapezoid(np.linalg.norm(velocities, axis=1), times))
+    closure = positions[-1] - positions[0]
+    area = np.trapezoid(np.cross(positions - positions[0], velocities), times, axis=0)
+    return PositionInvariants(
+        L=L,
+        closure=closure,
+        area=area,
+        closure_invariant=float(np.linalg.norm(closure) / L),
+        area_invariant=float(np.linalg.norm(area) / L**2),
+    )

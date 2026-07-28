@@ -73,6 +73,18 @@ def test_plotting_never_reruns_an_optimization():
     )
 
 
+def test_plotting_cannot_reach_the_disk_at_all():
+    """Stronger than the above: plotting does not even import the recorder.
+
+    Its functions take an already-loaded record object, so there is no expression
+    in plotting.py that can open, find or rebuild run data. Combined with the I/O
+    ban this makes "figures come only from stored data" structural rather than a
+    convention -- see test_recorder.py::test_plotting_is_unreachable_without_the_store.
+    """
+    imported = set(_imports(_tree("plotting")))
+    assert "recorder" not in imported and ".recorder" not in imported
+
+
 def test_basis_stays_analytic_numpy_only():
     """§4.2 -- basis.py is the home of the closed forms; numpy only.
 
