@@ -232,18 +232,15 @@ def test_gauss_newton_speedup_in_the_step00d_configuration():
 
 
 @pytest.mark.slow
-def test_in_the_planar_layer_the_objective_hessian_alone_carries_the_speedup():
-    """★ Measured, and it disagrees with §3.1's "objective Hessian alone is useless".
+def test_the_constraint_hessian_is_what_buys_the_speedup():
+    """★ §3.1 as written: supplying only the objective Hessian buys nothing.
 
-    That statement comes from step00e, i.e. from the 3D layer, where the
-    constraints run through the propagator and carry real curvature. In the planar
-    layer the closure and area constraints are only mildly nonlinear and the
-    objective dominates: ``objective_only`` needs exactly as many iterations as
-    ``gauss_newton`` (40 each), while ``default`` needs 449.
-
-    So the rule "supply both" stays safe and costs nothing, but in L1 it is the
-    objective Hessian that buys the 11x. The plan's claim is re-tested where it
-    was made in Step 12. See the dev log.
+    Step 08 reported the opposite, from this very test. That was wrong: the mode
+    dispatch in ``_nonlinear_constraint`` sent both ``gauss_newton`` and
+    ``objective_only`` down the zeroed-Hessian branch, so the two modes were
+    literally the same code and measuring them against each other measured
+    nothing. Fixed in Step 12; the numbers now reproduce step00e's hesstest table
+    row by row (rcp/M=12: 138 / 351 / 348 here against its 133 / 361 / 360).
     """
     common = {"gate": "linear_constraint", "maxiter": 3000}
     results = {
@@ -253,8 +250,42 @@ def test_in_the_planar_layer_the_objective_hessian_alone_carries_the_speedup():
     for mode, res in results.items():
         assert res.terms.energy == pytest.approx(83.7479, abs=5e-4), mode
         assert res.stop_reason == "converged", mode
-    assert results["objective_only"].nit == results["gauss_newton"].nit
-    assert results["default"].nit > 5 * results["gauss_newton"].nit
+
+    gn = results["gauss_newton"].nit
+    # the analytic objective Hessian on its own lands with the default, not with GN
+    assert results["objective_only"].nit > 5 * gn
+    assert results["default"].nit > 5 * gn
+    assert results["objective_only"].nit == pytest.approx(results["default"].nit, rel=0.30)
+
+
+def test_the_three_hessian_modes_are_actually_distinct_configurations():
+    """Guard for the dispatch bug above: same objective, three different setups.
+
+    Cheap and structural -- it inspects what is handed to scipy rather than how
+    fast it runs, so it fails immediately if two modes are ever collapsed again.
+    """
+    from scipy.optimize import BFGS
+
+    M = 12
+    a0, P = optimize._gate_projection(M, T, np.pi)
+    constraint_hess = {
+        mode: optimize._nonlinear_constraint(problem(M=M, hessian_mode=mode), a0, P).hess
+        for mode in optimize.HESSIAN_MODES
+    }
+    assert callable(constraint_hess["gauss_newton"])
+    assert not isinstance(constraint_hess["gauss_newton"], BFGS)
+    for mode in ("objective_only", "default"):
+        assert isinstance(constraint_hess[mode], BFGS), mode
+
+    objective_hess = {
+        mode: optimize._objective(problem(M=M, hessian_mode=mode), a0, P)[2]
+        for mode in optimize.HESSIAN_MODES
+    }
+    # both Hessian-supplying modes expose the same analytic objective Hessian; what
+    # distinguishes them from each other is only the constraint side checked above
+    # (whether `default` hands the objective to scipy is decided in solve()).
+    for mode in ("gauss_newton", "objective_only"):
+        assert np.allclose(objective_hess[mode](np.zeros(M - 1)), T**2 * np.eye(M - 1)), mode
 
 
 # --------------------------------------------------------------------------
