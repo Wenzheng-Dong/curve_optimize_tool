@@ -1,0 +1,27 @@
+# 仅忽略【根目录】下以下划线 _ 打头的文件和文件夹。
+# 前导 / 把模式锚定到根目录：嵌套在普通文件夹里的 _ 打头文件不受影响
+# （例如 src/curve_opt/_internal.py 仍会被 git 追踪）。
+/_*
+
+# 项目规划 / agent 协作文档：本地中文，不纳入版本控制
+CLAUDE.md
+AGENTS.md
+
+# Claude Code 本地权限设置（含机器相关路径）
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+
+# Python 构建 / 缓存产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# 环境
+.venv/
+venv/
