@@ -12,7 +12,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import matplotlib
 import pytest
+
+# Figures are produced head-less in tests; must precede any pyplot import.
+matplotlib.use("Agg")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

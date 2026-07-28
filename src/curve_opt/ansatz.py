@@ -260,13 +260,33 @@ def _rel_rms(residual, reference) -> float:
     return float(np.sqrt(np.mean(np.asarray(residual) ** 2)) / ref)
 
 
+def _theta_of_samples(om_x, times) -> float:
+    """Gate angle of a *sampled* ansatz: ``int Omega_x dt`` on its own grid.
+
+    Integrated on the source sampling with no interpolation, because that is the
+    densest information available and this number becomes the winding branch --
+    the right-hand side of the gate constraint (``_plan.md`` §8.3). Going through
+    the coarser projection grid instead costs an order of accuracy: for the naive
+    single mode at K = 20001 source samples this is exact to ~1e-9, against ~7e-8
+    after interpolation onto N = 4000.
+
+    It remains a quadrature estimate: a sampled ansatz has no closed-form gate
+    angle, and its total turning is defined only as well as its sampling.
+    """
+    return float(np.trapezoid(om_x, times))
+
+
 def _planar_invariants(om_target, times, T: float, N: int):
-    """closure/L and signed area/L^2 of a planar Omega_x sampling, via geometry."""
+    """closure/L and signed area/L^2 of a planar Omega_x sampling, via geometry.
+
+    The chain integrates on cell midpoints, so the samples are interpolated onto
+    that grid; with a dense source (K >> N) the interpolation error sits far below
+    the O(dt^2) quadrature error of the chain itself.
+    """
     t_mid, _ = geometry.midpoint_grid(T, N)
     om_mid = np.interp(t_mid, times, om_target)
     c = geometry.chain(om_mid, T)
     return (
-        float(c.theta_edge[-1]),
         float(np.linalg.norm(c.closure) / T),
         float(c.area[0] / T**2),
     )
@@ -302,14 +322,15 @@ def project(src: AnsatzSource, M: int, T: float = 1.0, N: int = geometry.N_DEFAU
     theta_after = basis.gate_angle(a, T)
 
     if src.is_planar:
-        theta_before, closure_before, area_before = _planar_invariants(om_x, times, T, N)
+        theta_before = _theta_of_samples(om_x, times)
+        closure_before, area_before = _planar_invariants(om_x, times, T, N)
         # After projection the ansatz *is* the coefficient vector, so the
         # after-values are evaluated on it directly rather than on its samples.
         closure_after = float(np.linalg.norm(geometry.closure(a, T, N)) / T)
         area_after = float(geometry.area_invariant(a, T, N))
     elif src.positions is not None:
         inv = geometry.invariants_of_positions(src.times, src.positions)
-        theta_before = float(np.trapezoid(om_x, times))
+        theta_before = _theta_of_samples(om_x, times)
         closure_before, area_before = inv.closure_invariant, inv.area_invariant
         closure_after = area_after = None  # needs the SU(2) propagator -- Step 11
     else:
