@@ -260,8 +260,24 @@ def _rel_rms(residual, reference) -> float:
     return float(np.sqrt(np.mean(np.asarray(residual) ** 2)) / ref)
 
 
+def _theta_of_samples_3d(om_x, om_y, T: float) -> float:
+    """Total rotation angle of a *non-planar* sampled control, via the propagator.
+
+    ★ ``int Omega_x dt`` is the gate angle only when ``Omega_y == 0``. For a
+    genuinely 3D control the rotation must be read off ``U(T)`` -- otherwise a
+    family like ``alpha_3d`` is reported as turning 12.43 rad when the unitary it
+    actually produces is essentially the identity. Cross-checked against cct's own
+    ``rotation_angle`` for the same curve in ``tests/test_propagate.py``.
+    """
+    from curve_opt import propagate  # noqa: PLC0415
+
+    chain = propagate.chain(om_x, om_y, T)
+    angle, _ = propagate.gate_rotation(chain.U_edge[-1])
+    return float(angle)
+
+
 def _theta_of_samples(om_x, times) -> float:
-    """Gate angle of a *sampled* ansatz: ``int Omega_x dt`` on its own grid.
+    """Gate angle of a *planar* sampled ansatz: ``int Omega_x dt`` on its own grid.
 
     Integrated on the source sampling with no interpolation, because that is the
     densest information available and this number becomes the winding branch --
@@ -319,7 +335,13 @@ def project(src: AnsatzSource, M: int, T: float = 1.0, N: int = geometry.N_DEFAU
         np.concatenate([om_x - fit_x, om_y - fit_y]), np.concatenate([om_x, om_y])
     )
 
-    theta_after = basis.gate_angle(a, T)
+    # For a planar ansatz the projected gate angle is the exact linear row; for a
+    # non-planar one it has to come from the propagator, same reason as above.
+    theta_after = (
+        basis.gate_angle(a, T)
+        if src.is_planar
+        else _theta_of_samples_3d(*(np.asarray(v) for v in (fit_x, fit_y)), T)
+    )
 
     if src.is_planar:
         theta_before = _theta_of_samples(om_x, times)
@@ -330,9 +352,16 @@ def project(src: AnsatzSource, M: int, T: float = 1.0, N: int = geometry.N_DEFAU
         area_after = float(geometry.area_invariant(a, T, N))
     elif src.positions is not None:
         inv = geometry.invariants_of_positions(src.times, src.positions)
-        theta_before = _theta_of_samples(om_x, times)
+        theta_before = _theta_of_samples_3d(om_x, om_y, T)
         closure_before, area_before = inv.closure_invariant, inv.area_invariant
-        closure_after = area_after = None  # needs the SU(2) propagator -- Step 11
+        # After projection the ansatz is the pair (a, b), and rebuilding r(t) from
+        # it needs the SU(2) propagator. Imported lazily so that the planar layer
+        # never pays for JAX matrix work it does not use, and so that this module
+        # keeps working if propagate is unavailable.
+        from curve_opt import propagate  # noqa: PLC0415
+
+        closure_after = propagate.closure_invariant(a, b, T, N)
+        area_after = propagate.area_invariant(a, b, T, N)
     else:
         raise ValueError(
             f"ansatz {src.name!r} is non-planar and carries no positions, so its "

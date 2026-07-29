@@ -85,12 +85,14 @@ import numpy as np
 from scipy.optimize import BFGS, LinearConstraint, NonlinearConstraint, minimize
 from scipy.sparse import csr_matrix
 
-from curve_opt import basis, geometry, metrics
+from curve_opt import basis, geometry, metrics, propagate
 
 __all__ = [
     "EarlyStop",
     "HESSIAN_MODES",
+    "MAXITER_FLOOR",
     "N_CLAIM",
+    "N_CLAIM_3D",
     "N_SURVEY",
     "Problem",
     "SolveResult",
@@ -106,6 +108,15 @@ N_CLAIM = 20_000
 
 #: Optimization grid for survey runs, where the deliverable is the trajectory.
 N_SURVEY = 4_000
+
+#: Optimization grid for the general layer. step00e used 4000, and the constraint
+#: Jacobian there costs 37..180 ms against 0.07 ms for the objective, so the grid
+#: cannot simply be raised to N_CLAIM: at N = 20000 one 3D solve would run for
+#: tens of minutes. Fine-grid re-evaluation still happens at 1e5 / 5e5.
+N_CLAIM_3D = 4_000
+
+#: §3.1: >= 1500 planar, >= 6000 in the general layer.
+MAXITER_FLOOR = {"planar": 1500, "general": 6000}
 
 HESSIAN_MODES = ("gauss_newton", "objective_only", "default")
 
@@ -156,7 +167,14 @@ class Problem(NamedTuple):
     theta: float
     """Exact winding-branch value: the right-hand side of the gate constraint."""
     coeffs0: np.ndarray
-    """Starting coefficients, normally the projected ansatz (step-0 output)."""
+    """Starting coefficients for ``Omega_x``, normally the projected ansatz."""
+    coeffs0_b: np.ndarray | None = None
+    """Starting coefficients for ``Omega_y``. Present => the general (L2) layer.
+
+    ``None`` selects the planar layer, where ``Omega_y`` is identically zero and no
+    propagator is needed. The two layers share this one entry point on purpose
+    (``_plan.md`` §4.3 item 3): the solver does not know which one it is on.
+    """
     N_grid: int = N_CLAIM
     lam: float = 0.0
     """Weight of ``T * s`` in the objective. ``0`` disables the epigraph block."""
@@ -176,6 +194,14 @@ class Problem(NamedTuple):
     @property
     def uses_epigraph(self) -> bool:
         return self.lam != 0.0
+
+    @property
+    def layer(self) -> str:
+        return "planar" if self.coeffs0_b is None else "general"
+
+    @property
+    def n_coeffs(self) -> int:
+        return self.M if self.coeffs0_b is None else 2 * self.M
 
 
 class EarlyStop(NamedTuple):
@@ -241,7 +267,10 @@ def _objective(problem: Problem, a0, P):
 
     ``f = (T^2 / 2) |a0 + P z|^2 + lambda T s``, so the gradient is
     ``T^2 P^T a`` (plus ``lambda T`` on ``s``) and the Hessian is the constant
-    ``blockdiag(T^2 P^T P, 0)`` -- ``T^2 I`` in the reduced block.
+    ``blockdiag(T^2 P^T P, 0)`` -- ``T^2 I`` in the reduced block. In the general
+    layer ``P`` is the identity on 2M variables and ``a`` is the concatenation
+    ``[a, b]``, so the same expression covers the fluence of both components
+    (``int Omega^2 dt = int (Omega_x^2 + Omega_y^2) dt``, one closed form).
     """
     T, lam = problem.T, problem.lam
     nz = P.shape[1]
@@ -269,26 +298,48 @@ def _objective(problem: Problem, a0, P):
 
 
 def _nonlinear_constraint(problem: Problem, a0, P):
-    """closure (2) + area (1) as one hard equality block, Jacobian by ``jax.jacrev``."""
+    """The hard equality block, with its Jacobian by ``jax.jacrev``.
+
+    Planar layer: closure (2) + area (1); the gate is eliminated or linear.
+    General layer: gate (3) + closure (3) + area (3) = the nine equations of
+    ``_plan.md`` §2.3, all nonlinear, evaluated through the SU(2) propagator. The
+    gate cannot be eliminated affinely there -- it is not a linear functional of
+    the coefficients once ``Omega_y != 0``.
+    """
     T, N = problem.T, problem.N_grid
     nz = P.shape[1]
     n = nz + (1 if problem.uses_epigraph else 0)
     a0_j, P_j = jnp.asarray(a0), jnp.asarray(P)
 
-    def residual(x):
-        a = a0_j + P_j @ x[:nz]
-        return geometry.equality_residuals(a, T, N)
+    if problem.layer == "general":
+        M = problem.M
+        U_target = propagate.target_x(problem.theta)
+
+        def residual(x):
+            return propagate.equality_residuals(x[:M], x[M : 2 * M], T, N, U_target)
+
+    else:
+
+        def residual(x):
+            a = a0_j + P_j @ x[:nz]
+            return geometry.equality_residuals(a, T, N)
 
     fun = jax.jit(residual)
     jac = jax.jit(jax.jacrev(residual))
 
-    if problem.hessian_mode == "default":
-        hess = BFGS()
-    else:
+    if problem.hessian_mode == "gauss_newton":
         zeros = csr_matrix((n, n))
 
         def hess(x, v):  # Gauss-Newton: drop the constraint curvature
             return zeros
+
+    else:
+        # ``objective_only`` and ``default`` differ only in the *objective* Hessian;
+        # both leave the constraint Hessian to scipy's quasi-Newton update. Lumping
+        # objective_only in with gauss_newton here (as this function did until
+        # Step 12) makes the two modes literally identical, which is how Step 08
+        # came to report that the objective Hessian alone carries the speedup.
+        hess = BFGS()
 
     return NonlinearConstraint(
         lambda x: np.asarray(fun(jnp.asarray(x))),
@@ -312,8 +363,33 @@ def _epigraph_constraints(problem: Problem, a0, P):
     peak is measured in the smoke test and recorded in the manifest.
     """
     nz = P.shape[1]
-    t_peak = np.linspace(0.0, problem.T, problem.n_peak + 2)[1:-1]
-    S = basis.design_matrix(t_peak, problem.T, problem.M)
+    M, T = problem.M, problem.T
+    t_peak = np.linspace(0.0, T, problem.n_peak + 2)[1:-1]
+    S = basis.design_matrix(t_peak, T, M)
+
+    if problem.layer == "general":
+        # ★ With Omega_y != 0 the peak is |Omega| = hypot(Omega_x, Omega_y), so the
+        # epigraph is a second-order cone rather than a pair of half-spaces:
+        # Omega_x(t_k)^2 + Omega_y(t_k)^2 - s^2 <= 0. Still smooth, still convex,
+        # but no longer a LinearConstraint -- section 3's "peak constraints are all
+        # linear inequalities" is a statement about the planar layer only.
+        S_j = jnp.asarray(S)
+
+        def cone(x):
+            om_x = S_j @ x[:M]
+            om_y = S_j @ x[M : 2 * M]
+            return om_x**2 + om_y**2 - x[2 * M] ** 2
+
+        fun = jax.jit(cone)
+        jac = jax.jit(jax.jacrev(cone))
+        return NonlinearConstraint(
+            lambda x: np.asarray(fun(jnp.asarray(x))),
+            -np.inf,
+            0.0,
+            jac=lambda x: np.asarray(jac(jnp.asarray(x))),
+            hess=BFGS(),
+        )
+
     SP, Sa0 = S @ P, S @ a0
     ones = np.ones((problem.n_peak, 1))
     A = np.vstack([np.hstack([SP, -ones]), np.hstack([-SP, -ones])])
@@ -326,23 +402,39 @@ def _epigraph_constraints(problem: Problem, a0, P):
 # --------------------------------------------------------------------------
 
 
-def reevaluate(coeffs, T: float, grids=FINE_GRIDS) -> dict:
+def reevaluate(coeffs, T: float, grids=FINE_GRIDS, coeffs_b=None, theta=None) -> dict:
     """Re-evaluate the residuals on finer grids -- mandatory for a claim.
 
     ``_plan.md`` §6.4 item 2: a residual claim must survive 4..25x refinement. The
     energy invariant is analytic and grid-free, so it is reported once; closure
-    and area are re-integrated per grid.
+    and area are re-integrated per grid. With *coeffs_b* given the general layer's
+    nine residuals are re-evaluated through the propagator instead.
     """
     coeffs = np.asarray(coeffs, dtype=float)
-    out = {"energy": basis.energy_invariant(coeffs, T), "grids": {}}
+    general = coeffs_b is not None
+    flat = np.concatenate([coeffs, np.asarray(coeffs_b, dtype=float)]) if general else coeffs
+    out = {"energy": basis.energy_invariant(flat, T), "layer": "general" if general else "planar",
+           "grids": {}}
     for N in grids:
-        out["grids"][str(N)] = {
-            "closure": geometry.closure_invariant(coeffs, T, N),
-            "area": geometry.area_invariant(coeffs, T, N),
-            "max_equality_residual": float(
-                np.max(np.abs(np.asarray(geometry.equality_residuals(coeffs, T, N))))
-            ),
-        }
+        if general:
+            U_target = propagate.target_x(np.pi if theta is None else theta)
+            residuals = np.asarray(
+                propagate.equality_residuals(coeffs, coeffs_b, T, N, U_target)
+            )
+            out["grids"][str(N)] = {
+                "closure": propagate.closure_invariant(coeffs, coeffs_b, T, N),
+                "area": propagate.area_invariant(coeffs, coeffs_b, T, N),
+                "gate": float(np.max(np.abs(residuals[:3]))),
+                "max_equality_residual": float(np.max(np.abs(residuals))),
+            }
+        else:
+            out["grids"][str(N)] = {
+                "closure": geometry.closure_invariant(coeffs, T, N),
+                "area": geometry.area_invariant(coeffs, T, N),
+                "max_equality_residual": float(
+                    np.max(np.abs(np.asarray(geometry.equality_residuals(coeffs, T, N))))
+                ),
+            }
     return out
 
 
@@ -354,6 +446,7 @@ def manifest_for(problem: Problem, *, early_stop: EarlyStop | None = None, **ext
         "T": problem.T,
         "target_gate": dict(problem.target_gate or {"name": "unspecified"}),
         "N_grid": problem.N_grid,
+        "layer": problem.layer,
         "winding_branch": float(problem.theta),
         "theta_before": (None if problem.theta_before is None else float(problem.theta_before)),
         "objective": {
@@ -401,17 +494,23 @@ def solve(
         raise ValueError(f"hessian_mode must be one of {HESSIAN_MODES}")
     if problem.gate not in ("projection", "linear_constraint"):
         raise ValueError(f"unknown gate handling {problem.gate!r}")
-    if problem.maxiter < 1500:
+    floor = MAXITER_FLOOR[problem.layer]
+    if problem.maxiter < floor:
         raise ValueError(
-            f"maxiter={problem.maxiter} is below the planar floor of 1500 (_plan.md §3.1); "
-            "a run that stops on the cap cannot enter a quantitative claim"
+            f"maxiter={problem.maxiter} is below the {problem.layer} floor of {floor} "
+            "(_plan.md §3.1); a run that stops on the cap cannot enter a quantitative claim"
         )
 
     T, M, N = problem.T, problem.M, problem.N_grid
     g = basis.gate_row(M, T)
     coeffs0 = np.asarray(problem.coeffs0, dtype=float)
 
-    if problem.gate == "projection":
+    if problem.layer == "general":
+        # No gate elimination: with Omega_y != 0 the gate is three nonlinear
+        # equations, so it joins the constraint block instead.
+        a0, P = np.zeros(2 * M), np.eye(2 * M)
+        z0 = np.concatenate([coeffs0, np.asarray(problem.coeffs0_b, dtype=float)])
+    elif problem.gate == "projection":
         a0, P = _gate_projection(M, T, problem.theta)
         # least-squares start in the reduced variables: the component of the
         # ansatz that survives gate elimination. Nothing else is changed.
@@ -424,13 +523,22 @@ def solve(
     def to_coeffs(x):
         return a0 + P @ np.asarray(x[:nz], dtype=float)
 
-    x0 = np.concatenate([z0, [metrics.peak(to_coeffs(z0), T, problem.n_peak) / T]]) if (
-        problem.uses_epigraph
-    ) else z0
+    def split(x):
+        """Solver variables -> ``(a, b)``; ``b`` is None in the planar layer."""
+        full = to_coeffs(x)
+        return (full[:M], full[M:]) if problem.layer == "general" else (full, None)
+
+    def peak_of(x):
+        a, b = split(x)
+        return metrics.peak(a, T, problem.n_peak, b=b)
+
+    x0 = (
+        np.concatenate([z0, [peak_of(z0) / T]]) if problem.uses_epigraph else np.asarray(z0)
+    )
 
     fun, jac, hess = _objective(problem, a0, P)
     constraints = [_nonlinear_constraint(problem, a0, P)]
-    if problem.gate == "linear_constraint":
+    if problem.layer == "planar" and problem.gate == "linear_constraint":
         constraints.append(LinearConstraint(np.hstack([g, np.zeros(len(x0) - M)])[None, :],
                                             problem.theta, problem.theta))
     if problem.uses_epigraph:
@@ -442,28 +550,42 @@ def solve(
         else {"jac": jac, "hess": BFGS()}
     )
 
+    U_target_3d = propagate.target_x(problem.theta) if problem.layer == "general" else None
+
     # ---- callback: record, then decide whether to stop ------------------
     state = {"n": 0, "checkpoints": 0, "stalled": 0, "prev": None, "early": False}
 
+    def evaluate(x):
+        """Cost terms, the equality block and the gate residual at *x*."""
+        a, b = split(x)
+        terms = metrics.cost_terms(a, T, N, b=b)
+        if problem.layer == "general":
+            eq = np.asarray(propagate.equality_residuals(a, b, T, N, U_target_3d))
+            gate_res = float(np.max(np.abs(eq[:3])))
+            return terms, eq[3:], gate_res
+        eq = np.asarray(geometry.equality_residuals(a, T, N))
+        return terms, eq, abs(float(g @ a) - problem.theta)
+
     def callback(xk, res=None):
         state["n"] += 1
-        a = to_coeffs(xk)
-        terms = metrics.cost_terms(a, T, N)
-        eq = np.asarray(geometry.equality_residuals(a, T, N))
+        a, b = split(xk)
+        terms, eq, gate_res = evaluate(xk)
         s = float(xk[nz]) if problem.uses_epigraph else None
         total = terms.energy + (problem.lam * T * s if s is not None else 0.0)
 
         if recorder is not None and (state["n"] - 1) % problem.checkpoint_every == 0:
+            n_closure = 3 if problem.layer == "general" else 2
             recorder.append(
                 state["n"] - 1,
                 a,
+                b,
                 cost_total=total,
                 cost_energy=terms.energy,
                 cost_curv=terms.curv,
                 cost_peak=terms.peak,
-                res_gate=abs(float(g @ a) - problem.theta),
-                res_closure=eq[:2],
-                res_area=eq[2:],
+                res_gate=gate_res,
+                res_closure=eq[:n_closure],
+                res_area=eq[n_closure:],
             )
             state["checkpoints"] += 1
 
@@ -505,9 +627,13 @@ def solve(
     else:
         stop_reason = "failed"
 
-    fine = reevaluate(coeffs, T, fine_grids) if fine_grids else {}
-    terms = metrics.cost_terms(coeffs, T, N)
-    eq = np.asarray(geometry.equality_residuals(coeffs, T, N))
+    coeffs_a, coeffs_b = split(res.x)
+    fine = (
+        reevaluate(coeffs_a, T, fine_grids, coeffs_b=coeffs_b, theta=problem.theta)
+        if fine_grids
+        else {}
+    )
+    terms, eq, gate_res = evaluate(res.x)
     s_final = float(res.x[nz]) if problem.uses_epigraph else None
 
     out = SolveResult(
@@ -518,7 +644,7 @@ def solve(
         wall_clock_s=wall,
         n_checkpoints=state["checkpoints"],
         terms=terms,
-        gate_residual=abs(float(g @ coeffs) - problem.theta),
+        gate_residual=gate_res,
         equality_residuals=eq,
         epigraph_s=s_final,
         fine_grid=fine,

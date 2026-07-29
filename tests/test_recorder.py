@@ -294,11 +294,32 @@ def test_step0_round_trip_planar(written):
 
 
 def test_step0_stores_unavailable_after_values_as_nan_not_zero(tmp_path):
-    """A non-planar ansatz has no after-projection robustness until Step 11.
+    """An unavailable value must be storable as "unknown", never as 0.0.
 
-    Storing 0.0 there would read as "perfectly robust"; NaN plus an availability
-    flag cannot be misread.
+    Storing 0.0 for a missing robustness value would read as "perfectly robust".
+    Until Step 11 this was the everyday case (a non-planar ansatz had no
+    after-projection closure without the propagator); now that the propagator
+    exists the situation is constructed explicitly, because the *recorder's*
+    contract still has to hold for any field that is ever unavailable.
     """
+    ansatz.register_builtin_families(overwrite=True)
+    report = ansatz.project_named("naive", M=8, T=1.0, theta=np.pi)._replace(
+        closure_after=None, area_after=None
+    )
+    assert report.closure_after is None
+
+    rec = recorder.Recorder("r_unavailable", _manifest(), root=tmp_path)
+    rec.write_step0(report)
+    rec.close(status="synthetic", nit=0, wall_clock_s=0.0)
+    step0 = recorder.load("r_unavailable", root=tmp_path).step0
+    assert np.isnan(float(step0["closure_after"]))
+    assert not bool(step0["closure_after_available"])
+    assert np.isnan(float(step0["area_after"]))
+    assert not np.isnan(float(step0["closure_before"]))
+
+
+def test_step0_of_a_3d_ansatz_now_carries_real_after_values(tmp_path):
+    """The counterpart: Step 11 filled these in, and they must round-trip."""
     src = ansatz.AnsatzSource(
         name="fake3d",
         tier="forced",
@@ -311,15 +332,14 @@ def test_step0_stores_unavailable_after_values_as_nan_not_zero(tmp_path):
         ),
     )
     report = ansatz.project(src, M=8, T=1.0)
-    assert report.closure_after is None
+    assert report.closure_after is not None and report.area_after is not None
 
     rec = recorder.Recorder("r3d", _manifest(), root=tmp_path)
     rec.write_step0(report)
     rec.close(status="synthetic", nit=0, wall_clock_s=0.0)
     step0 = recorder.load("r3d", root=tmp_path).step0
-    assert np.isnan(float(step0["closure_after"]))
-    assert not bool(step0["closure_after_available"])
-    assert not np.isnan(float(step0["closure_before"]))
+    assert bool(step0["closure_after_available"])
+    assert float(step0["closure_after"]) == pytest.approx(report.closure_after, rel=1e-12)
 
 
 # --------------------------------------------------------------------------
