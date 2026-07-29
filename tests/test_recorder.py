@@ -225,6 +225,38 @@ def test_stored_costs_equal_values_recomputed_from_coefficients(written):
     assert deviations == {"cost_energy": 0.0, "cost_curv": 0.0, "cost_peak": 0.0}
 
 
+def test_verify_history_uses_manifest_layer_when_general_b_is_exactly_zero(tmp_path):
+    """A zero Omega_y checkpoint is still general-layer data (Step 16 regression)."""
+    rng = np.random.default_rng(0)
+    a = rng.normal(size=14) * 10.0
+    b = np.zeros(14)
+    terms = metrics.cost_terms(a, T, N_GRID, b=b)
+    rec = recorder.Recorder(
+        "general_zero_b",
+        _manifest(M=14, layer="general"),
+        root=tmp_path,
+    )
+    rec.append(
+        iter=0,
+        coeffs_a=a,
+        coeffs_b=b,
+        cost_total=terms.energy,
+        cost_energy=terms.energy,
+        cost_curv=terms.curv,
+        cost_peak=terms.peak,
+        res_gate=1.0,
+        res_closure=np.ones(3),
+        res_area=np.ones(3),
+    )
+    rec.close(status="synthetic", nit=0, wall_clock_s=0.0)
+    loaded = recorder.load("general_zero_b", root=tmp_path)
+    assert recorder.verify_history(loaded, atol=0.0) == {
+        "cost_energy": 0.0,
+        "cost_curv": 0.0,
+        "cost_peak": 0.0,
+    }
+
+
 def test_verify_history_catches_a_tampered_cost(written):
     """Negative control: the check must actually be able to fail."""
     root, run_id = written
