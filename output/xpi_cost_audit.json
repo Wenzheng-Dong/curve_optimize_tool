@@ -1,0 +1,37 @@
+{
+  "l1_m12": {
+    "all_converged": true,
+    "history_verified_atol": 0.0,
+    "implementation_commits": [
+      "643238c373f37e5c9b5e58d3c2c3f8a423f126c2"
+    ],
+    "n_records": 8,
+    "run_ids": [
+      "20260729_Xpi_rcp_lemniscate_M12_w0_claim",
+      "20260729_Xpi_rcp_petal_M12_w0_claim",
+      "20260729_Xpi_triangle_pulse_arc_M12_w0_claim",
+      "20260729_Xpi_gaussian_arc_M12_w0_claim",
+      "20260729_Xpi_treble_clef_loop_M12_w0_claim",
+      "20260729_Xpi_circle_arc_M12_w0_claim",
+      "20260729_Xpi_min_norm_gate_only_M12_w0_claim",
+      "20260729_Xpi_naive_M12_w0_claim"
+    ],
+    "title": "X(pi), planar L1, M=12, N=20000"
+  },
+  "l2_m14": {
+    "all_converged": true,
+    "history_verified_atol": 0.0,
+    "implementation_commits": [
+      "42c4dbef57e97198bfc58c762b68ca70fbfcf334"
+    ],
+    "n_records": 5,
+    "run_ids": [
+      "20260729_Xpi_alpha_3d_M14_L2_step16",
+      "20260729_Xpi_tilted_lemniscate_M14_L2_step16",
+      "20260729_Xpi_rcp_lemniscate_M14_L2_step16",
+      "20260729_Xpi_rcp_petal_M14_L2_step16",
+      "20260729_Xpi_naive_M14_L2_step16"
+    ],
+    "title": "X(pi), general L2, M=14, N=4000"
+  }
+}
