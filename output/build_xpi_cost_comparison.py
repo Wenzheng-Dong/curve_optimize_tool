@@ -87,6 +87,14 @@ def load_group(key: str) -> list:
         if not record.step0 or not record.history or not record.final:
             raise ValueError(f"{record.run_id} is incomplete")
         recorder.verify_history(record, atol=0.0)
+        for metric, _ in METRICS:
+            stored = float(record.history[f"cost_{metric}"][-1])
+            final = float(record.final["terms"][metric])
+            if abs(stored - final) > 1e-10:
+                raise ValueError(
+                    f"{record.run_id}: last checkpoint {metric}={stored} "
+                    f"does not match final.json {final}"
+                )
     return records
 
 
@@ -188,6 +196,23 @@ def residual_history(record) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.nda
     return iterations, gate, closure, area
 
 
+def residual_trajectory(record) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Step-0, stored checkpoints, and exact final residual blocks."""
+    iterations, gate, closure, area = residual_history(record)
+    final_eq = np.abs(np.asarray(record.final["equality_residuals"], dtype=float))
+    n_closure = 3 if record.manifest["layer"] == "general" else 2
+    final_gate = float(record.final["gate_residual"])
+    final_closure = float(np.max(final_eq[:n_closure]))
+    final_area = float(np.max(final_eq[n_closure:]))
+    final_step = int(record.final["nit"]) + 1
+    return (
+        np.concatenate([iterations, [final_step]]),
+        np.concatenate([gate, [final_gate]]),
+        np.concatenate([closure, [final_closure]]),
+        np.concatenate([area, [final_area]]),
+    )
+
+
 def first_reach(iterations, values, threshold: float = THRESHOLD) -> int | None:
     hits = np.flatnonzero(np.asarray(values) <= threshold)
     return None if hits.size == 0 else int(np.asarray(iterations)[hits[0]])
@@ -232,6 +257,151 @@ def plot_trajectories(key: str, records: list, trajectories: dict[str, list[dict
     provenance(fig, records, GROUPS[key]["title"])
     fig.tight_layout(rect=(0, 0.025, 1, 0.92))
     fig.savefig(OUT / f"xpi_{key}_cost_trajectories.png", dpi=170)
+    plt.close(fig)
+
+
+def plot_constraint_trajectories(key: str, records: list) -> None:
+    fig, axes = plt.subplots(1, 3, figsize=(14.5, 4.6))
+    colors = plt.get_cmap("tab10")(np.linspace(0, 0.9, len(records)))
+    for record, color in zip(records, colors):
+        name = short_label(record)
+        iterations, gate, closure, area = residual_trajectory(record)
+        for ax, values, title in zip(
+            axes,
+            (gate, closure, area),
+            ("Gate residual", "Closure residual", "Area residual"),
+        ):
+            plotted = np.maximum(values, 1e-18)
+            ax.plot(iterations, plotted, color=color, lw=1.35, alpha=0.9, label=name)
+            ax.scatter(
+                iterations[0],
+                plotted[0],
+                s=32,
+                facecolors="white",
+                edgecolors=[color],
+                zorder=4,
+            )
+            ax.scatter(
+                iterations[-1],
+                plotted[-1],
+                s=45,
+                color=color,
+                marker="*",
+                zorder=4,
+            )
+            ax.axhline(THRESHOLD, color="0.45", ls="--", lw=0.8)
+            ax.set_yscale("log")
+            ax.set_xlabel("recorded optimization step (0 = projected input)")
+            ax.set_ylabel("max |residual component|")
+            ax.set_title(title)
+            ax.grid(alpha=0.22)
+    axes[-1].legend(fontsize=6.7, loc="best")
+    fig.suptitle(
+        GROUPS[key]["title"]
+        + "\nhard-constraint trajectories; dashed line = 1e-9",
+        fontsize=12,
+    )
+    provenance(fig, records, GROUPS[key]["title"])
+    fig.tight_layout(rect=(0, 0.025, 1, 0.92))
+    fig.savefig(OUT / f"xpi_{key}_constraint_trajectories.png", dpi=170)
+    plt.close(fig)
+
+
+def waveform_stages(record, n_points: int = 1600) -> dict:
+    """Raw family waveform, projected solver input, halfway checkpoint, and final."""
+    T = float(record.manifest["T"])
+    t = np.linspace(0.0, T, n_points)
+    step0_times = np.asarray(record.step0["times"], dtype=float)
+    raw_x = np.interp(t, step0_times, np.asarray(record.step0["omega_x_before"], dtype=float))
+    raw_y = np.interp(t, step0_times, np.asarray(record.step0["omega_y_before"], dtype=float))
+    a0 = np.asarray(record.step0["coeffs_a"], dtype=float)
+    b0 = np.asarray(record.step0["coeffs_b"], dtype=float)
+    middle_index = record.n_checkpoints // 2
+    a_mid = np.asarray(record.history["coeffs_a"][middle_index], dtype=float)
+    b_mid = np.asarray(record.history["coeffs_b"][middle_index], dtype=float)
+    a_final = np.asarray(record.history["coeffs_a"][-1], dtype=float)
+    b_final = np.asarray(record.history["coeffs_b"][-1], dtype=float)
+    return {
+        "times": t,
+        "middle_iteration": int(record.history["iter"][middle_index]),
+        "final_iteration": int(record.history["iter"][-1]),
+        "raw": (raw_x, raw_y),
+        "projected": (basis.omega(a0, t, T), basis.omega(b0, t, T)),
+        "middle": (basis.omega(a_mid, t, T), basis.omega(b_mid, t, T)),
+        "final": (basis.omega(a_final, t, T), basis.omega(b_final, t, T)),
+    }
+
+
+def draw_waveform_panel(ax, t, stages, component: int, title: str) -> None:
+    styles = (
+        ("raw", "0.7", "-", 1.0, "raw curve-family waveform"),
+        ("projected", "0.15", "--", 1.15, "projected optimizer input"),
+        ("middle", "C1", ":", 1.35, f"middle checkpoint (iter {stages['middle_iteration']})"),
+        ("final", "C0", "-", 1.6, f"last checkpoint (iter {stages['final_iteration']})"),
+    )
+    for stage, color, linestyle, width, label in styles:
+        ax.plot(
+            t,
+            stages[stage][component],
+            color=color,
+            ls=linestyle,
+            lw=width,
+            label=label,
+        )
+    ax.axhline(0.0, color="0.85", lw=0.7, zorder=0)
+    ax.set_title(title, fontsize=9)
+    ax.grid(alpha=0.18)
+
+
+def plot_waveform_evolution(key: str, records: list) -> None:
+    if key == "l1_m12":
+        ncols = 2
+        nrows = int(np.ceil(len(records) / ncols))
+        fig, axes = plt.subplots(
+            nrows, ncols, figsize=(12.5, 2.7 * nrows), sharex=True
+        )
+        axes = np.asarray(axes).reshape(-1)
+        for ax, record in zip(axes, records):
+            stages = waveform_stages(record)
+            draw_waveform_panel(
+                ax,
+                stages["times"],
+                stages,
+                0,
+                short_label(record) + r" — $\Omega_x(t)$",
+            )
+            ax.set_ylabel(r"$\Omega_x$")
+        for ax in axes[len(records):]:
+            ax.axis("off")
+        axes[0].legend(fontsize=6.5, ncol=2, loc="best")
+        for ax in axes[-ncols:]:
+            ax.set_xlabel("$t/T$")
+    else:
+        fig, axes = plt.subplots(
+            len(records), 2, figsize=(13.0, 2.35 * len(records)), sharex=True
+        )
+        for row, record in enumerate(records):
+            stages = waveform_stages(record)
+            name = short_label(record)
+            draw_waveform_panel(
+                axes[row, 0], stages["times"], stages, 0, name + r" — $\Omega_x(t)$"
+            )
+            draw_waveform_panel(
+                axes[row, 1], stages["times"], stages, 1, name + r" — $\Omega_y(t)$"
+            )
+            axes[row, 0].set_ylabel(r"$\Omega_x$")
+            axes[row, 1].set_ylabel(r"$\Omega_y$")
+        axes[0, 1].legend(fontsize=6.5, ncol=2, loc="best")
+        axes[-1, 0].set_xlabel("$t/T$")
+        axes[-1, 1].set_xlabel("$t/T$")
+    fig.suptitle(
+        GROUPS[key]["title"]
+        + "\nwaveform evolution: raw family → projected input → middle → final",
+        fontsize=12,
+    )
+    provenance(fig, records, GROUPS[key]["title"])
+    fig.tight_layout(rect=(0, 0.02, 1, 0.95))
+    fig.savefig(OUT / f"xpi_{key}_waveform_evolution.png", dpi=170)
     plt.close(fig)
 
 
@@ -376,6 +546,8 @@ def main() -> None:
                 for row in rows
             )
         plot_trajectories(key, records, trajectories)
+        plot_constraint_trajectories(key, records)
+        plot_waveform_evolution(key, records)
         plot_initial_final(key, records, trajectories)
         plot_feasibility_heatmap(key, records, summary)
         audit[key] = {
@@ -389,6 +561,7 @@ def main() -> None:
                 record.manifest["stop_reason"] == "converged" for record in records
             ),
             "history_verified_atol": 0.0,
+            "last_checkpoint_matches_final_terms_atol": 1e-10,
         }
 
     write_csv(OUT / "xpi_cost_summary.csv", all_summary)

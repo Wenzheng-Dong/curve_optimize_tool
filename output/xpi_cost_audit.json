@@ -5,6 +5,7 @@
     "implementation_commits": [
       "643238c373f37e5c9b5e58d3c2c3f8a423f126c2"
     ],
+    "last_checkpoint_matches_final_terms_atol": 1e-10,
     "n_records": 8,
     "run_ids": [
       "20260729_Xpi_rcp_lemniscate_M12_w0_claim",
@@ -24,6 +25,7 @@
     "implementation_commits": [
       "42c4dbef57e97198bfc58c762b68ca70fbfcf334"
     ],
+    "last_checkpoint_matches_final_terms_atol": 1e-10,
     "n_records": 5,
     "run_ids": [
       "20260729_Xpi_alpha_3d_M14_L2_step16",
