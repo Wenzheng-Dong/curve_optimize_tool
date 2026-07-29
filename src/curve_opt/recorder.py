@@ -456,11 +456,17 @@ def verify_history(record: RunRecord, *, atol: float = 0.0) -> dict:
     N = int(record.manifest["N_grid"])
     a_all = np.asarray(record.history["coeffs_a"])
     b_all = np.asarray(record.history["coeffs_b"])
+    is_general = record.manifest.get("layer") == "general"
 
     deviations = {"cost_energy": 0.0, "cost_curv": 0.0, "cost_peak": 0.0}
     for k in range(a_all.shape[0]):
         a, b = a_all[k], b_all[k]
-        b_arg = b if np.any(b) else None
+        # Layer is problem metadata, not a property that can be inferred from one
+        # checkpoint.  A general-layer trajectory may begin exactly at b == 0 or
+        # converge back to it; recomputing that row through the planar arithmetic
+        # path changes floating-point summation order and can break the exact
+        # redundant-channel check even though the record is sound (Step 16).
+        b_arg = b if is_general else None
         terms = metrics.cost_terms(a, T, N, b=b_arg)
         for column, value in (
             ("cost_energy", terms.energy),

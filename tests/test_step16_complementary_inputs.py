@@ -63,6 +63,22 @@ def test_first_reach_is_horizontal_and_right_censored():
     assert analysis.first_reach(iterations, values, 1e-12) is None
 
 
+def test_endpoint_clustering_distinguishes_signed_and_physical_basins():
+    endpoints = np.array([[1.0, 0.0], [1.0, 1e-5], [-1.0, 0.0]])
+    scale = np.max(np.linalg.norm(endpoints, axis=1))
+    signed = np.linalg.norm(
+        endpoints[:, None, :] - endpoints[None, :, :], axis=2
+    ) / scale
+    mod_sign = np.minimum(
+        signed,
+        np.linalg.norm(
+            endpoints[:, None, :] + endpoints[None, :, :], axis=2
+        ) / scale,
+    )
+    assert analysis.connected_components(signed, 1e-3) == [[0, 1], [2]]
+    assert analysis.connected_components(mod_sign, 1e-3) == [[0, 1, 2]]
+
+
 def test_offline_analysis_has_no_optimizer_import_or_solve_call():
     source = (ROOT / "_dev_logs" / "step16_analyse.py").read_text()
     assert "from curve_opt import optimize" not in source
