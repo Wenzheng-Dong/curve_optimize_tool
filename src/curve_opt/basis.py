@@ -39,6 +39,11 @@ from __future__ import annotations
 import numpy as np
 
 __all__ = [
+    "bandwidth_diagonal",
+    "bandwidth_gradient",
+    "bandwidth_hessian",
+    "bandwidth_invariant",
+    "c1_row",
     "design_matrix",
     "energy_bound",
     "energy_bound_truncated",
@@ -86,9 +91,9 @@ def omega(a, t, T: float) -> np.ndarray:
 def omega_dot(a, t, T: float) -> np.ndarray:
     """Analytic time derivative ``sum_n a_n (n pi / T) cos(n pi t / T)``.
 
-    Not used by the current constraint set; it is the closed form the future
-    bandwidth term ``int Omega_dot^2 dt`` and the C1 switch-on condition
-    ``sum_n n a_n = 0`` are built on (``_plan.md`` §2.3 row 7).
+    The closed form behind the §2.3 row 7 constraints: :func:`bandwidth_invariant`
+    (``int Omega_dot^2 dt``) and :func:`c1_row` (``sum_n n a_n = 0``). Kept as a
+    sampler for waveform plots and for cross-checking those two analytically.
     """
     a = np.asarray(a, dtype=float)
     t = np.asarray(t, dtype=float)
@@ -149,6 +154,85 @@ def energy_hessian(n_coeffs: int, T: float) -> np.ndarray:
     §3.1).
     """
     return T**2 * np.eye(n_coeffs)
+
+
+def bandwidth_diagonal(M: int, T: float) -> np.ndarray:
+    """Diagonal ``d_n`` of the bandwidth quadratic form (``_plan.md`` §2.3 row 7).
+
+    ``int_0^T Omega_dot^2 dt`` is diagonal in this basis because the cosines are
+    orthogonal on ``[0, T]``::
+
+        int_0^T Omega_dot^2 dt = (T / 2) sum_n a_n^2 (n pi / T)^2
+
+    and the scale-invariant form multiplies by ``T^3`` (``Omega_dot^2 dt`` carries
+    ``time^-3``), leaving ``d_n = pi^2 T^2 n^2 / 2`` with
+
+        bandwidth_invariant = sum_n d_n a_n^2.
+
+    Diagonal and constant: gradient and Hessian are exact and free, which is why
+    this constraint never needs a Gauss-Newton approximation (see
+    :func:`bandwidth_hessian`).
+    """
+    n = _harmonics(M)
+    return 0.5 * np.pi**2 * T**2 * n**2
+
+
+def bandwidth_invariant(coeffs, T: float, *, M: int | None = None) -> float:
+    """Scale-invariant bandwidth ``(int_0^T Omega_dot^2 dt) * T^3``.
+
+    Pass ``a`` for a planar problem. In the general case pass the concatenation
+    ``[a, b]`` together with *M*: both components contribute additively
+    (``int (Omega_x_dot^2 + Omega_y_dot^2) dt``), so the diagonal simply repeats
+    per block. Exact -- no quadrature.
+    """
+    c = np.asarray(coeffs, dtype=float)
+    M = c.size if M is None else M
+    if c.size % M:
+        raise ValueError(f"coefficient vector of length {c.size} is not a multiple of M={M}")
+    d = np.tile(bandwidth_diagonal(M, T), c.size // M)
+    return float(d @ (c * c))
+
+
+def bandwidth_gradient(coeffs, T: float, *, M: int | None = None) -> np.ndarray:
+    """Gradient of :func:`bandwidth_invariant`: ``2 d * coeffs``."""
+    c = np.asarray(coeffs, dtype=float)
+    M = c.size if M is None else M
+    d = np.tile(bandwidth_diagonal(M, T), c.size // M)
+    return 2.0 * d * c
+
+
+def bandwidth_hessian(n_coeffs: int, T: float, *, M: int | None = None) -> np.ndarray:
+    """Hessian of :func:`bandwidth_invariant`: the constant matrix ``2 diag(d)``.
+
+    Constant, so it is handed to ``trust-constr`` exactly in every
+    ``hessian_mode``. ``hessian_mode`` governs the *nonlinear equality* block
+    (closure / area / 3D gate), which is where the 5.9..25.3x of §3.1 was
+    measured; approximating a free exact Hessian would buy nothing.
+    """
+    M = n_coeffs if M is None else M
+    d = np.tile(bandwidth_diagonal(M, T), n_coeffs // M)
+    return 2.0 * np.diag(d)
+
+
+def c1_row(M: int, T: float, end: str = "start") -> np.ndarray:
+    """Row ``r`` with ``r . a = Omega_dot(0)`` (``end='start'``) or ``Omega_dot(T)``.
+
+    ``Omega_dot(0) = sum_n a_n (n pi / T)`` and
+    ``Omega_dot(T) = sum_n a_n (n pi / T) (-1)^n``, so the C1 switch-on/switch-off
+    condition ``_plan.md`` §2.3 row 7 calls ``sum_n n a_n = 0`` is one *free
+    linear equality* -- the same kind of object as the gate row, and eliminable
+    the same way.
+
+    ★ On the odd-harmonic subspace the two ends are not independent: for odd
+    ``n``, ``(-1)^n = -1``, so ``r_T = -r_0`` there. Imposing both ends removes
+    two degrees of freedom overall but only one inside the symmetric sector where
+    the unconstrained optimum lives (see ``_dev_logs/step14a_design.md`` §2).
+    """
+    if end not in ("start", "end"):
+        raise ValueError(f"end must be 'start' or 'end', got {end!r}")
+    n = _harmonics(M)
+    row = n * np.pi / T
+    return row * (-1.0) ** n if end == "end" else row
 
 
 def energy_bound(theta: float) -> float:
