@@ -119,6 +119,14 @@ def test_configuration_floors_are_enforced():
         optimize.solve(problem(gate="hope"))
 
 
+def test_fixed_budget_survey_explicitly_allows_a_subfloor_cap():
+    p = problem(maxiter=3, fixed_budget_survey=True, N_grid=optimize.N_SURVEY)
+    result = optimize.solve(p, fine_grids=())
+    assert result.stop_reason == "maxiter"
+    assert result.void_for_claims
+    assert optimize.manifest_for(p)["solver"]["fixed_budget_survey"] is True
+
+
 # --------------------------------------------------------------------------
 # ★ acceptance: reproduce step00d
 # --------------------------------------------------------------------------
@@ -434,7 +442,9 @@ def test_result_advertises_whether_it_may_be_claimed():
         scipy_message="",
     )
     assert res.void_for_claims
-    assert res._replace(stop_reason="converged").void_for_claims is False
+    converged = res._replace(stop_reason="converged")
+    assert converged.void_for_claims is False
+    assert converged._replace(fixed_budget_survey=True).void_for_claims is True
 
 
 # --------------------------------------------------------------------------

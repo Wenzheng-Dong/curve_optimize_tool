@@ -191,6 +191,8 @@ class Problem(NamedTuple):
     gate: str = "projection"
     hessian_mode: str = "gauss_newton"
     maxiter: int = 1500
+    fixed_budget_survey: bool = False
+    """Allow a sub-floor maxiter only for an explicitly labelled survey run."""
     gtol: float = 1e-12
     xtol: float = 1e-14
     checkpoint_every: int = 1
@@ -253,10 +255,11 @@ class SolveResult(NamedTuple):
     epigraph_s: float | None
     fine_grid: dict
     scipy_message: str
+    fixed_budget_survey: bool = False
 
     @property
     def void_for_claims(self) -> bool:
-        return self.stop_reason != "converged"
+        return self.stop_reason != "converged" or self.fixed_budget_survey
 
 
 # --------------------------------------------------------------------------
@@ -579,6 +582,7 @@ def manifest_for(problem: Problem, *, early_stop: EarlyStop | None = None, **ext
         "solver": {
             "method": "trust-constr",
             "maxiter": problem.maxiter,
+            "fixed_budget_survey": bool(problem.fixed_budget_survey),
             "hessian_mode": problem.hessian_mode,
             "gate_handling": problem.gate,
             "gtol": problem.gtol,
@@ -616,10 +620,10 @@ def solve(
     if problem.gate not in ("projection", "linear_constraint"):
         raise ValueError(f"unknown gate handling {problem.gate!r}")
     floor = MAXITER_FLOOR[problem.layer]
-    if problem.maxiter < floor:
+    if problem.maxiter < floor and not problem.fixed_budget_survey:
         raise ValueError(
             f"maxiter={problem.maxiter} is below the {problem.layer} floor of {floor} "
-            "(_plan.md §3.1); a run that stops on the cap cannot enter a quantitative claim"
+            "(_plan.md §3.1); use fixed_budget_survey=True only for a censored survey"
         )
 
     T, M, N = problem.T, problem.M, problem.N_grid
@@ -771,6 +775,7 @@ def solve(
         epigraph_s=s_final,
         fine_grid=fine,
         scipy_message=str(res.message),
+        fixed_budget_survey=bool(problem.fixed_budget_survey),
     )
 
     if recorder is not None:
@@ -787,5 +792,6 @@ def solve(
             epigraph_s=s_final,
             fine_grid=fine,
             terms=out.terms._asdict(),
+            void_for_claims=out.void_for_claims,
         )
     return out
