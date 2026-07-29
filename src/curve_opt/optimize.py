@@ -19,6 +19,13 @@ handed to ``minimize`` directly: it is not differentiable in the coefficients,
 and ``lambda = 0`` skips the whole epigraph block rather than adding a
 zero-weight non-smooth term.
 
+:attr:`Problem.extra_constraints` optionally adds the ``_plan.md`` §2.3 row-7
+constraints -- a bandwidth cap ``(int Omega_dot^2 dt) T^3 <= B`` and the C1
+switch-on/off equalities ``Omega_dot(0) = 0`` / ``Omega_dot(T) = 0``. Both are
+analytic in the coefficients (a diagonal quadratic form and a free linear row),
+so both come with exact Jacobians *and* exact Hessians. Default empty: a
+``Problem`` built without them reproduces Steps 08/12 exactly.
+
 Gate elimination
 ----------------
 Two routes, both exact enough and both available (``_plan.md`` §3.1):
@@ -96,6 +103,7 @@ __all__ = [
     "N_SURVEY",
     "Problem",
     "SolveResult",
+    "extra_constraint_residuals",
     "manifest_for",
     "reevaluate",
     "snap_winding_branch",
@@ -190,6 +198,19 @@ class Problem(NamedTuple):
     ansatz: dict | None = None
     theta_before: float | None = None
     """The ansatz's *measured* total turning, recorded alongside the exact branch."""
+    extra_constraints: tuple = ()
+    """Declarative specs for the ``_plan.md`` §2.3 row-7 constraints, e.g.
+
+    * ``{"kind": "bandwidth", "bound": B}`` -- ``(int Omega_dot^2 dt) T^3 <= B``,
+      one convex quadratic inequality with an exact constant Hessian;
+    * ``{"kind": "c1", "ends": ("start", "end")}`` -- ``Omega_dot = 0`` at those
+      ends, one *free linear equality* per end (per field component in the
+      general layer).
+
+    Declarative on purpose: the specs go into the manifest verbatim, so a record
+    stays self-describing (``_plan.md`` §5.1). Empty tuple = the baseline
+    constraint set of Steps 08/12, bit-for-bit.
+    """
 
     @property
     def uses_epigraph(self) -> bool:
@@ -397,6 +418,83 @@ def _epigraph_constraints(problem: Problem, a0, P):
     return LinearConstraint(A, -np.inf, ub)
 
 
+EXTRA_CONSTRAINT_KINDS = ("bandwidth", "c1")
+
+
+def _c1_rows(problem: Problem, ends) -> np.ndarray:
+    """C1 conditions as rows in *coefficient* space (length :attr:`Problem.n_coeffs`).
+
+    One row per end in the planar layer; two per end in the general layer, since
+    ``Omega_dot(0) = 0`` there means both components switch on smoothly.
+    """
+    M, T = problem.M, problem.T
+    rows = []
+    for end in ends:
+        r = basis.c1_row(M, T, end)
+        if problem.layer == "general":
+            rows.append(np.concatenate([r, np.zeros(M)]))
+            rows.append(np.concatenate([np.zeros(M), r]))
+        else:
+            rows.append(r)
+    return np.asarray(rows)
+
+
+def _extra_constraint_objects(problem: Problem, a0, P, n_x: int) -> list:
+    """Turn :attr:`Problem.extra_constraints` into scipy constraint objects.
+
+    Everything here is analytic in the coefficients -- a linear row for C1, a
+    diagonal quadratic form for the bandwidth -- so both get exact Jacobians and
+    exact Hessians regardless of ``hessian_mode``. That flag governs the
+    *nonlinear equality* block, which is where §3.1's 5.9..25.3x was measured;
+    approximating a constant Hessian that costs nothing would only blur the
+    comparison with the baseline runs.
+    """
+    nz = P.shape[1]
+    out = []
+    for spec in problem.extra_constraints:
+        kind = spec.get("kind")
+        if kind not in EXTRA_CONSTRAINT_KINDS:
+            raise ValueError(f"unknown extra constraint {kind!r}, expected one of "
+                             f"{EXTRA_CONSTRAINT_KINDS}")
+        if kind == "c1":
+            rows = _c1_rows(problem, spec.get("ends", ("start",)))
+            A = np.zeros((rows.shape[0], n_x))
+            A[:, :nz] = rows @ P
+            rhs = -(rows @ a0)
+            out.append(LinearConstraint(A, rhs, rhs))
+        else:
+            bound = float(spec["bound"])
+            if bound <= 0.0:
+                raise ValueError(f"bandwidth bound must be positive, got {bound}")
+            M_block = problem.M
+            # ★ Normalized by the bound: the raw form has values ~1e4 and Jacobian
+            # entries ~1e4 against an equality block of order 1, and trust-constr
+            # weighs constraint violations against each other unscaled. Dividing by
+            # the bound makes the constraint read ``bandwidth / B - 1 <= 0``, an
+            # O(1) quantity, without changing the feasible set.
+            H_full = basis.bandwidth_hessian(problem.n_coeffs, problem.T, M=M_block) / bound
+            H_red = np.zeros((n_x, n_x))
+            H_red[:nz, :nz] = P.T @ H_full @ P
+
+            def value(x, _b=bound, _M=M_block):
+                a = a0 + P @ np.asarray(x[:nz], dtype=float)
+                return np.array([basis.bandwidth_invariant(a, problem.T, M=_M) / _b - 1.0])
+
+            def jacobian(x, _b=bound, _M=M_block):
+                a = a0 + P @ np.asarray(x[:nz], dtype=float)
+                row = np.zeros((1, n_x))
+                row[0, :nz] = P.T @ basis.bandwidth_gradient(a, problem.T, M=_M) / _b
+                return row
+
+            def hessian(x, v, _H=H_red):
+                return csr_matrix(float(v[0]) * _H)
+
+            out.append(
+                NonlinearConstraint(value, -np.inf, 0.0, jac=jacobian, hess=hessian)
+            )
+    return out
+
+
 # --------------------------------------------------------------------------
 # evaluation helpers
 # --------------------------------------------------------------------------
@@ -438,6 +536,28 @@ def reevaluate(coeffs, T: float, grids=FINE_GRIDS, coeffs_b=None, theta=None) ->
     return out
 
 
+def extra_constraint_residuals(problem: Problem, coeffs, coeffs_b=None) -> dict:
+    """Violation of each §2.3 row-7 constraint at a point, as a plain dict.
+
+    Signed: ``c1`` entries are equality residuals (zero when satisfied), the
+    ``bandwidth`` entry is ``value - bound`` (``<= 0`` when satisfied). Analytic,
+    so it needs no grid and is the right thing to check a converged point with.
+    """
+    flat = np.asarray(coeffs, dtype=float)
+    if coeffs_b is not None:
+        flat = np.concatenate([flat, np.asarray(coeffs_b, dtype=float)])
+    out = {}
+    for i, spec in enumerate(problem.extra_constraints):
+        if spec.get("kind") == "c1":
+            rows = _c1_rows(problem, spec.get("ends", ("start",)))
+            out[f"c1_{i}"] = float(np.max(np.abs(rows @ flat)))
+        else:
+            value = basis.bandwidth_invariant(flat, problem.T, M=problem.M)
+            out[f"bandwidth_{i}"] = float(value - float(spec["bound"]))
+            out[f"bandwidth_{i}_value"] = value
+    return out
+
+
 def manifest_for(problem: Problem, *, early_stop: EarlyStop | None = None, **extra) -> dict:
     """Build the manifest dict for *problem*. Pure data -- the recorder writes it."""
     man = {
@@ -448,6 +568,7 @@ def manifest_for(problem: Problem, *, early_stop: EarlyStop | None = None, **ext
         "N_grid": problem.N_grid,
         "layer": problem.layer,
         "winding_branch": float(problem.theta),
+        "extra_constraints": [dict(spec) for spec in problem.extra_constraints],
         "theta_before": (None if problem.theta_before is None else float(problem.theta_before)),
         "objective": {
             "terms": ["energy"] + (["peak"] if problem.uses_epigraph else []),
@@ -543,6 +664,7 @@ def solve(
                                             problem.theta, problem.theta))
     if problem.uses_epigraph:
         constraints.append(_epigraph_constraints(problem, a0, P))
+    constraints.extend(_extra_constraint_objects(problem, a0, P, len(x0)))
 
     objective_kwargs = (
         {"jac": jac, "hess": hess}

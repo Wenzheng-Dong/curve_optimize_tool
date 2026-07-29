@@ -435,3 +435,127 @@ def test_result_advertises_whether_it_may_be_claimed():
     )
     assert res.void_for_claims
     assert res._replace(stop_reason="converged").void_for_claims is False
+
+
+# --------------------------------------------------------------------------
+# Step 14a: the §2.3 row-7 constraints (bandwidth cap, C1 switch-on/off)
+# --------------------------------------------------------------------------
+
+
+def test_bandwidth_form_matches_numerical_quadrature():
+    """The analytic diagonal form against midpoint quadrature of omega_dot^2."""
+    rng = np.random.default_rng(7)
+    for M in (3, 12):
+        a = rng.normal(size=M)
+        for T_ in (1.0, 2.5):
+            N = 200_000
+            t = (np.arange(N) + 0.5) * T_ / N
+            numeric = float(np.sum(basis.omega_dot(a, t, T_) ** 2) * (T_ / N)) * T_**3
+            assert basis.bandwidth_invariant(a, T_) == pytest.approx(numeric, rel=1e-8)
+
+
+def test_bandwidth_gradient_and_hessian_are_exact():
+    rng = np.random.default_rng(8)
+    M = 9
+    a = rng.normal(size=M)
+    grad = basis.bandwidth_gradient(a, T)
+    eps = 1e-6
+    for i in range(M):
+        step = np.zeros(M)
+        step[i] = eps
+        fd = (basis.bandwidth_invariant(a + step, T) - basis.bandwidth_invariant(a - step, T)) / (
+            2 * eps
+        )
+        assert grad[i] == pytest.approx(fd, rel=1e-6)
+    # the form is quadratic, so the Hessian reproduces it exactly from any point
+    H = basis.bandwidth_hessian(M, T)
+    assert 0.5 * a @ H @ a == pytest.approx(basis.bandwidth_invariant(a, T), rel=1e-12)
+
+
+def test_bandwidth_of_the_general_layer_adds_the_two_components():
+    rng = np.random.default_rng(9)
+    M = 6
+    a, b = rng.normal(size=M), rng.normal(size=M)
+    both = basis.bandwidth_invariant(np.concatenate([a, b]), T, M=M)
+    assert both == pytest.approx(
+        basis.bandwidth_invariant(a, T) + basis.bandwidth_invariant(b, T), rel=1e-14
+    )
+
+
+def test_c1_row_reproduces_omega_dot_at_the_ends():
+    rng = np.random.default_rng(10)
+    M = 11
+    a = rng.normal(size=M)
+    for T_ in (1.0, 3.0):
+        assert basis.c1_row(M, T_, "start") @ a == pytest.approx(
+            float(basis.omega_dot(a, [0.0], T_)[0]), rel=1e-12
+        )
+        assert basis.c1_row(M, T_, "end") @ a == pytest.approx(
+            float(basis.omega_dot(a, [T_], T_)[0]), rel=1e-12
+        )
+
+
+def test_c1_rows_coincide_up_to_sign_on_the_odd_subspace():
+    """★ The structural fact behind the Step 14a design: on odd harmonics the
+    two ends are the same condition, so 'C1 at both ends' costs one dof there."""
+    M = 12
+    a = np.zeros(M)
+    a[0::2] = np.random.default_rng(11).normal(size=M // 2)  # odd harmonics only
+    r0, rT = basis.c1_row(M, T, "start"), basis.c1_row(M, T, "end")
+    assert r0 @ a == pytest.approx(-(rT @ a), rel=1e-12)
+
+
+def test_empty_extra_constraints_changes_nothing():
+    base = problem(M=8, N_grid=4000, maxiter=1500)
+    with_empty = base._replace(extra_constraints=())
+    r1 = optimize.solve(base, fine_grids=())
+    r2 = optimize.solve(with_empty, fine_grids=())
+    assert np.allclose(r1.coeffs, r2.coeffs, atol=0.0, rtol=0.0)
+
+
+def test_c1_constraint_is_met_exactly_and_costs_energy():
+    """C1 is a linear equality: it holds to machine precision, and it is not free."""
+    free = optimize.solve(problem(M=12, N_grid=4000), fine_grids=())
+    spec = ({"kind": "c1", "ends": ("start", "end")},)
+    constrained = optimize.solve(
+        problem(M=12, N_grid=4000, extra_constraints=spec), fine_grids=()
+    )
+    assert constrained.stop_reason == "converged"
+    res = optimize.extra_constraint_residuals(
+        problem(M=12, extra_constraints=spec), constrained.coeffs
+    )
+    assert res["c1_0"] < 1e-9
+    # the hard equality block is untouched by the new row
+    assert np.max(np.abs(constrained.equality_residuals)) < 1e-10
+    assert constrained.terms.energy > free.terms.energy
+
+
+def test_bandwidth_cap_binds_and_the_hard_equalities_survive():
+    """★ The cap has a feasibility floor: the minimum bandwidth reachable on the
+    gate+closure+area manifold is ``0.884 * B_free`` at M=12 (step14a §2), so a
+    cap below that makes the problem infeasible, not merely tight. 0.94 is inside
+    the window."""
+    free = optimize.solve(problem(M=12, N_grid=4000), fine_grids=())
+    free_bw = basis.bandwidth_invariant(free.coeffs, T)
+    bound = 0.94 * free_bw
+    spec = ({"kind": "bandwidth", "bound": bound},)
+    capped = optimize.solve(problem(M=12, N_grid=4000, extra_constraints=spec), fine_grids=())
+    assert capped.stop_reason == "converged"
+    assert basis.bandwidth_invariant(capped.coeffs, T) <= bound * (1 + 1e-7)
+    assert np.max(np.abs(capped.equality_residuals)) < 1e-10
+    assert capped.terms.energy > free.terms.energy  # a binding cap costs energy
+
+
+def test_unknown_extra_constraint_is_refused():
+    with pytest.raises(ValueError, match="unknown extra constraint"):
+        optimize.solve(problem(M=8, N_grid=2000, extra_constraints=({"kind": "smooth"},)),
+                       fine_grids=())
+
+
+def test_manifest_carries_the_extra_constraints_verbatim():
+    spec = ({"kind": "bandwidth", "bound": 1234.5}, {"kind": "c1", "ends": ("start",)})
+    man = optimize.manifest_for(problem(extra_constraints=spec))
+    assert man["extra_constraints"] == [
+        {"kind": "bandwidth", "bound": 1234.5},
+        {"kind": "c1", "ends": ("start",)},
+    ]
