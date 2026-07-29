@@ -442,7 +442,9 @@ def test_result_advertises_whether_it_may_be_claimed():
         scipy_message="",
     )
     assert res.void_for_claims
-    assert res._replace(stop_reason="converged").void_for_claims is False
+    converged = res._replace(stop_reason="converged")
+    assert converged.void_for_claims is False
+    assert converged._replace(fixed_budget_survey=True).void_for_claims is True
 
 
 # --------------------------------------------------------------------------

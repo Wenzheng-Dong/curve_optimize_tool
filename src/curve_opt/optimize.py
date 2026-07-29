@@ -255,7 +255,7 @@ class SolveResult(NamedTuple):
     epigraph_s: float | None
     fine_grid: dict
     scipy_message: str
-    fixed_budget_survey: bool
+    fixed_budget_survey: bool = False
 
     @property
     def void_for_claims(self) -> bool:
