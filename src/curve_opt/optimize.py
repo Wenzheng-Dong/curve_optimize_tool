@@ -889,6 +889,23 @@ class BudgetProblem(NamedTuple):
     perturbative-validity argument alone, before any guarded ``rcp+3D``
     construction run existed to check against (task brief F05b §5: "不许调
     rho 去让 ②通过")."""
+    fluence_cap: float | None = None
+    """F06b hard fluence cap: ``int_0^T kappa^2 dt <= fluence_cap``, ``kappa``
+    being the *design*-curve coefficients ``a`` (``_dev_logs/F06b_task_brief.md``
+    §2). ``None`` (default) disables the constraint entirely, reproducing every
+    pre-F06b run bit-for-bit. Deliberately a hard inequality, not a
+    lambda-weighted soft term: the task brief's own reasoning is that no
+    noise moment determines a weight for it (it is not a budget item, it is a
+    guard for staying inside the perturbative regime C1-C4 are derived in --
+    same status as the peak epigraph and the F05b R guard). Convex quadratic
+    in ``a`` alone (``basis.energy_invariant``/``_gradient``/``_hessian``,
+    rescaled from that module's ``T=1``-normalized convention -- see
+    :func:`_budget_fluence_constraint`), so unlike the gate/peak/R-guard
+    blocks this one needs no epigraph and no Gauss-Newton approximation: its
+    Hessian is exact and constant, supplied to ``trust-constr`` regardless of
+    :attr:`hessian_mode` (mirrors the energy-era ``Problem``'s ``bandwidth``
+    ``extra_constraints`` kind, ``_nonlinear_constraint``'s sibling function
+    `_extra_constraint_objects`)."""
     hessian_mode: str = "gauss_newton"
     maxiter: int = 3000
     fixed_budget_survey: bool = False
@@ -1214,6 +1231,57 @@ def _budget_tau_guard_constraint(problem: BudgetProblem) -> LinearConstraint:
     return LinearConstraint(np.vstack([A_pos, A_neg]), -np.inf, 0.0)
 
 
+def _budget_fluence_constraint(problem: BudgetProblem) -> NonlinearConstraint:
+    """F06b: hard cap ``int_0^T kappa^2 dt <= fluence_cap`` on the design curve.
+
+    Sine-series orthogonality (``basis.py`` module docstring) makes this an
+    exact quadratic form in ``a`` alone,
+    ``int_0^T kappa^2 dt = (T / 2) |a|^2``. ``basis.energy_invariant``/
+    ``_gradient``/``_hessian`` already implement this quadratic form, but as
+    the *scale-invariant* ``(int Omega^2 dt) * L`` with ``L = T`` -- i.e. they
+    return ``T`` times the physical fluence here, so this function divides
+    each of value/gradient/Hessian by *one* extra factor of ``T`` to recover
+    the physical quantity (``_dev_logs/F06b_task_brief.md`` §2: "那套是 T=1
+    无量纲量，按 §3.1 折算").
+
+    ★ Normalized by the cap itself (mirrors the energy-era ``Problem``'s
+    ``bandwidth`` ``extra_constraints`` kind in ``_extra_constraint_objects``):
+    the raw form has values of order 1-10 against a gate-residual block of
+    order ``1e-9`` and ``trust-constr`` weighs constraint violations
+    unscaled, so the constraint reads ``fluence / cap - 1 <= 0``, an ``O(1)``
+    quantity, without changing the feasible set.
+
+    Exact and constant Hessian in ``a`` -- no Gauss-Newton approximation
+    needed, and this is supplied regardless of :attr:`BudgetProblem.hessian_mode`
+    (that flag only governs the *nonlinear-in-the-propagator* blocks: the
+    gate residual and the peak cone, per those two functions' own
+    docstrings). ``c``, ``Phi_0``, ``phi_vz``, ``s`` and ``r`` do not enter
+    the fluence at all, so their columns/rows are exactly zero.
+    """
+    M, T, cap = problem.M, problem.T, float(problem.fluence_cap)
+    if cap <= 0.0:
+        raise ValueError(f"fluence_cap must be positive, got {cap}")
+    n = problem.n_vars
+    H_full = basis.energy_hessian(M, T) / (T * cap)
+    H = np.zeros((n, n))
+    H[:M, :M] = H_full
+
+    def value(x):
+        a = np.asarray(x[:M], dtype=float)
+        return np.array([basis.energy_invariant(a, T) / (T * cap) - 1.0])
+
+    def jacobian(x):
+        a = np.asarray(x[:M], dtype=float)
+        row = np.zeros((1, n))
+        row[0, :M] = basis.energy_gradient(a, T) / (T * cap)
+        return row
+
+    def hessian(x, v, _H=H):
+        return csr_matrix(float(v[0]) * _H)
+
+    return NonlinearConstraint(value, -np.inf, 0.0, jac=jacobian, hess=hessian)
+
+
 def budget_manifest_for(problem: BudgetProblem, *, early_stop: EarlyStop | None = None, **extra) -> dict:
     """Build the manifest dict for a :class:`BudgetProblem`. Pure data.
 
@@ -1251,6 +1319,7 @@ def budget_manifest_for(problem: BudgetProblem, *, early_stop: EarlyStop | None 
             "rho": float(problem.rho),
             "bound": problem.tau_guard_bound,
         },
+        "fluence_cap": (None if problem.fluence_cap is None else float(problem.fluence_cap)),
         "objective": {
             "terms": ["c1", "c2", "c3", "c4"],
             "weights": dict(budget.weights_from_device(problem.device)._asdict()),
@@ -1347,6 +1416,8 @@ def solve_budget(
         _budget_peak_constraint(problem),
         _budget_tau_guard_constraint(problem),
     ]
+    if problem.fluence_cap is not None:
+        constraints.append(_budget_fluence_constraint(problem))
 
     objective_kwargs = (
         {"jac": jac, "hess": hess}
