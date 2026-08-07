@@ -89,10 +89,11 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from scipy.optimize import BFGS, LinearConstraint, NonlinearConstraint, minimize
+from scipy.optimize import BFGS, Bounds, LinearConstraint, NonlinearConstraint, minimize
 from scipy.sparse import csr_matrix
 
-from curve_opt import basis, geometry, metrics, propagate
+from curve_opt import basis, budget, gate, geometry, metrics, propagate
+from curve_opt.device import DEFAULT_DEVICE, Device
 
 __all__ = [
     "EarlyStop",
@@ -101,13 +102,19 @@ __all__ = [
     "N_CLAIM",
     "N_CLAIM_3D",
     "N_SURVEY",
+    "BudgetProblem",
+    "BudgetSolveResult",
+    "GATE_LEVELS",
     "Problem",
     "SolveResult",
+    "budget_manifest_for",
     "extra_constraint_residuals",
     "manifest_for",
     "reevaluate",
+    "reevaluate_budget",
     "snap_winding_branch",
     "solve",
+    "solve_budget",
 ]
 
 #: Optimization grid for a claim-run: what step00d used, and what makes the
@@ -791,6 +798,561 @@ def solve(
             equality_residuals=out.equality_residuals,
             epigraph_s=s_final,
             fine_grid=fine,
+            terms=out.terms._asdict(),
+            void_for_claims=out.void_for_claims,
+        )
+    return out
+
+
+# ==========================================================================
+# F04: the full-cost era's budget-mode problem
+# ==========================================================================
+# ``_plan_full_cost.md`` §2.4/§4.2: gate is the only hard constraint, C1-C4
+# are a soft weighted sum (:mod:`curve_opt.budget`), evaluated over a
+# genuinely different free-parameter set -- (a, c, Phi_0, Phi_vz), not (a, b)
+# -- than :class:`Problem` above. Kept as a *separate* NamedTuple and solver
+# entry point rather than folded into :class:`Problem`/:func:`solve`: the two
+# problems share almost no field semantics (the gate can no longer be
+# affinely eliminated, closure/area are not equality constraints any more,
+# the objective is not the analytic quadratic §3.1 built the mandatory
+# configuration around), and every one of the 25+ existing tests in
+# ``tests/test_optimize.py`` constructs ``Problem(...)`` without any of this
+# step's new fields -- overloading one NamedTuple with a mode flag would put
+# all of that at risk for a feature that shares only the solver library and
+# the general shape of "assemble scipy objects, call trust-constr". See
+# ``_dev_logs/F04_budget_objective.md`` for the alternative considered.
+#
+# Recorder integration is **not** wired up here: :mod:`curve_opt.recorder`'s
+# schema (``HISTORY_COLUMNS`` = ``cost_energy``/``cost_curv``/``cost_peak``,
+# ``res_closure``/``res_area``) is energy-era-specific, and
+# ``verify_history`` recomputes those columns through
+# :func:`curve_opt.metrics.cost_terms` -- a budget-mode run's checkpoints
+# (``cost_c1``..``cost_c4``, a gate-only residual) do not fit that contract,
+# and the task brief's F04 deliverable list does not include
+# ``recorder.py``. Flagged for leader disposition rather than silently
+# reshoehorned into the existing schema; :func:`solve_budget` still accepts
+# an optional *recorder* and will use it if the caller passes one whose
+# ``append``/``close`` happen to accept the extra keyword terms this module
+# provides, but no existing ``Recorder`` does today.
+
+GATE_LEVELS = ("three_level", "two_level")
+
+
+class BudgetProblem(NamedTuple):
+    """One F04 error-budget optimization problem. Pure data, no solver state.
+
+    Free parameters ``x = [a (M), c (M), Phi_0 (1), Phi_vz (1), s (1)]``,
+    ``n_coeffs = 2M + 2`` physical parameters plus the epigraph slack ``s``
+    (task brief §2.3: 2M + 2 = 42 at M = 20).
+    """
+
+    M: int
+    T: float
+    theta: float
+    """Exact winding-branch value, the right-hand side of ``U_target = target_x(theta)``."""
+    coeffs0_a: np.ndarray
+    """Starting coefficients for kappa (the design curvature series)."""
+    coeffs0_c: np.ndarray
+    """Starting coefficients for Phi's shifted-cosine series (the design torsion)."""
+    Phi_0_0: float = 0.0
+    phi_vz_0: float = 0.0
+    device: Device = DEFAULT_DEVICE
+    gate_level: str = "three_level"
+    """``"three_level"`` (default, claim-eligible): G measured on
+    :func:`curve_opt.gate.three_level_propagator`'s qubit block via
+    :func:`curve_opt.gate.polar_gate_residual`. ``"two_level"``: G measured
+    on the plain SU(2) propagator of the broadcast waveform via
+    :func:`curve_opt.propagate.gate_residual` -- a fast warm-start channel
+    only (task brief §2.3), never for a claim.
+    """
+    N_grid: int = geometry.N_DEFAULT
+    """Shared grid for the design chain (C1/C2/C3), the broadcast chain
+    (C4, the two-level gate route) and, when ``gate_level="three_level"``,
+    :func:`curve_opt.gate.three_level_propagator`. One grid, not three, so
+    every term of one forward pass is mutually consistent (module docstring
+    of :mod:`curve_opt.budget`: two chains, not three)."""
+    n_peak: int = 400
+    """Coarser grid the peak epigraph inequality is sampled on -- same
+    economy-grid rationale as :class:`Problem`'s field of the same name."""
+    hessian_mode: str = "gauss_newton"
+    maxiter: int = 3000
+    fixed_budget_survey: bool = False
+    gtol: float = 1e-12
+    xtol: float = 1e-14
+    checkpoint_every: int = 1
+    target_gate: dict | None = None
+    ansatz: dict | None = None
+
+    @property
+    def n_coeffs(self) -> int:
+        return 2 * self.M + 2
+
+    @property
+    def n_vars(self) -> int:
+        """Solver-vector length: :attr:`n_coeffs` plus the epigraph slack ``s``."""
+        return self.n_coeffs + 1
+
+
+class BudgetSolveResult(NamedTuple):
+    """Outcome of one :func:`solve_budget` call."""
+
+    coeffs_a: np.ndarray
+    coeffs_c: np.ndarray
+    Phi_0: float
+    phi_vz: float
+    s: float
+    stop_reason: str
+    status: int
+    nit: int
+    wall_clock_s: float
+    terms: budget.BudgetTerms
+    gate_residual: np.ndarray
+    c1_residual: np.ndarray
+    peak_phys: float
+    polar_margin: float | None
+    scipy_message: str
+    fixed_budget_survey: bool = False
+
+    @property
+    def void_for_claims(self) -> bool:
+        return self.stop_reason != "converged" or self.fixed_budget_survey
+
+
+def _split_budget(problem: BudgetProblem, x):
+    """Solver vector -> ``(a, c, Phi_0, phi_vz, s)``."""
+    M = problem.M
+    a = x[:M]
+    c = x[M : 2 * M]
+    Phi_0 = x[2 * M]
+    phi_vz = x[2 * M + 1]
+    s = x[2 * M + 2]
+    return a, c, Phi_0, phi_vz, s
+
+
+def _budget_x0(problem: BudgetProblem) -> np.ndarray:
+    """Initial solver vector: the given starting coefficients plus a measured ``s0``.
+
+    ``s0`` is the actual peak of the initial broadcast waveform on the peak
+    grid, clipped into ``[0, Omega_max]`` -- trust-constr does not require an
+    inequality-feasible start, but starting ``s`` at a value the ``Bounds``
+    object already rejects would be a needless own goal.
+    """
+    a0 = np.asarray(problem.coeffs0_a, dtype=float)
+    c0 = np.asarray(problem.coeffs0_c, dtype=float)
+    om_x0, om_y0 = budget.broadcast_waveform(
+        a0, c0, problem.Phi_0_0, problem.T, problem.device.delta, problem.n_peak
+    )
+    s0 = float(np.max(np.hypot(np.asarray(om_x0), np.asarray(om_y0))))
+    s0 = float(np.clip(s0, 0.0, problem.device.rabi_max_rate))
+    return np.concatenate([a0, c0, [problem.Phi_0_0, problem.phi_vz_0, s0]])
+
+
+def _budget_bounds(problem: BudgetProblem) -> Bounds:
+    """``s`` is bounded in ``[0, Omega_max]`` (the hardware ceiling); everything
+    else is free -- the epigraph mechanism this reuses (module docstring of
+    :class:`Problem`), specialized to a *fixed* physical ceiling rather than
+    an objective-weighted tradeoff (task brief §2.3: peak is a hard
+    inequality here, not a lambda-weighted objective term)."""
+    n = problem.n_vars
+    lb = np.full(n, -np.inf)
+    ub = np.full(n, np.inf)
+    lb[-1] = 0.0
+    ub[-1] = problem.device.rabi_max_rate
+    return Bounds(lb, ub)
+
+
+def _budget_objective(problem: BudgetProblem):
+    """Value / analytic gradient / Gauss-Newton Hessian of ``C = R . R``.
+
+    ``R`` = :func:`curve_opt.budget.residual_vector` -- see that module's
+    docstring for why ``C`` being literally a sum of squares makes
+    ``2 J_R^T J_R`` (dropping ``R``'s own second derivative) the natural
+    Gauss-Newton objective Hessian, the same approximation the constraint
+    block has used for its Hessian since Step 08.
+
+    ``fun``/``jac``/``hess`` share one ``(R(x), J_R(x))`` cache keyed on the
+    last ``x`` seen: ``trust-constr`` calls all three at the same point far
+    more often than not, and without the cache ``jac`` and ``hess`` each ran
+    their own ``jax.jacrev`` pass -- a genuine 2x in wall clock that muddied
+    the very Gauss-Newton-vs-``default`` comparison this Hessian exists to
+    win (acceptance criterion 3; see ``_dev_logs/F04_budget_objective.md``).
+    """
+    T, N, device = problem.T, problem.N_grid, problem.device
+
+    def residual(x):
+        a, c, Phi_0, _phi_vz, _s = _split_budget(problem, x)
+        return budget.residual_vector(a, c, Phi_0, T, device, N)
+
+    R = jax.jit(residual)
+    JR = jax.jit(jax.jacrev(residual))
+
+    cache = {"x": None, "r": None, "J": None}
+
+    def _refresh(x):
+        x = np.asarray(x, dtype=float)
+        if cache["x"] is None or not np.array_equal(cache["x"], x):
+            xj = jnp.asarray(x)
+            cache["x"] = x
+            cache["r"] = np.asarray(R(xj))
+            cache["J"] = np.asarray(JR(xj))
+
+    def fun(x):
+        _refresh(x)
+        r = cache["r"]
+        return float(r @ r)
+
+    def jac(x):
+        _refresh(x)
+        r, J = cache["r"], cache["J"]
+        return 2.0 * (J.T @ r)
+
+    def hess(x):
+        _refresh(x)
+        J = cache["J"]
+        return 2.0 * (J.T @ J)
+
+    return fun, jac, hess
+
+
+def _budget_gate_constraint(problem: BudgetProblem):
+    """The hard gate equality (3 components), dispatched on :attr:`BudgetProblem.gate_level`."""
+    T, N, device = problem.T, problem.N_grid, problem.device
+    U_target = propagate.target_x(problem.theta)
+    n = problem.n_vars
+    level = problem.gate_level
+    if level not in GATE_LEVELS:
+        raise ValueError(f"gate_level must be one of {GATE_LEVELS}, got {level!r}")
+
+    def residual(x):
+        a, c, Phi_0, phi_vz, _s = _split_budget(problem, x)
+        om_x, om_y = budget.broadcast_waveform(a, c, Phi_0, T, device.delta, N)
+        if level == "three_level":
+            U3 = gate.three_level_propagator(om_x, om_y, T, device.delta)
+            res, _W, _P = gate.polar_gate_residual(U3, U_target, phi_vz)
+        else:
+            chain2 = propagate.chain(om_x, om_y, T)
+            target = gate.rz(phi_vz) @ jnp.asarray(U_target, dtype=jnp.complex128)
+            res = propagate.gate_residual(chain2.U_edge[-1], target)
+        return res
+
+    fun = jax.jit(residual)
+    jac = jax.jit(jax.jacrev(residual))
+
+    if problem.hessian_mode == "gauss_newton":
+        zeros = csr_matrix((n, n))
+
+        def hess(x, v):
+            return zeros
+
+    else:
+        hess = BFGS()
+
+    return NonlinearConstraint(
+        lambda x: np.asarray(fun(jnp.asarray(x))),
+        0.0,
+        0.0,
+        jac=lambda x: np.asarray(jac(jnp.asarray(x))),
+        hess=hess,
+    )
+
+
+def _budget_c1_constraint(problem: BudgetProblem) -> LinearConstraint:
+    """The free linear ``P`` endpoint condition on ``a`` alone (2 rows).
+
+    ``basis.c1_row(M, T, 'start'/'end') . a = 0`` -- exact and free, the same
+    row :class:`Problem`'s ``extra_constraints={"kind": "c1", ...}`` already
+    uses. ``c`` never needs it (:mod:`curve_opt.parametrization`'s docstring,
+    "The c1 guard is an entry ticket"): ``tau``'s series is a sine series
+    like kappa's and is structurally zero at both ends for any ``c``.
+    """
+    M, T = problem.M, problem.T
+    n = problem.n_vars
+    rows = np.stack([basis.c1_row(M, T, "start"), basis.c1_row(M, T, "end")])
+    A = np.zeros((2, n))
+    A[:, :M] = rows
+    return LinearConstraint(A, 0.0, 0.0)
+
+
+def _budget_peak_constraint(problem: BudgetProblem):
+    """``Omega_x_out(t_k)^2 + Omega_y_out(t_k)^2 - s^2 <= 0`` on the peak grid.
+
+    Second-order cone, exactly :class:`Problem`'s general-layer epigraph
+    block but evaluated on the *broadcast* waveform (task brief §2.1: G/C4/
+    peak share the broadcast object) at :attr:`BudgetProblem.n_peak` grid
+    points via a fresh, coarser call to :func:`curve_opt.budget.broadcast_waveform`
+    (:mod:`curve_opt.parametrization`'s functions accept an arbitrary ``N``,
+    so this needs no new machinery).
+    """
+    T, device, n_peak = problem.T, problem.device, problem.n_peak
+    n = problem.n_vars
+
+    def cone(x):
+        a, c, Phi_0, _phi_vz, s = _split_budget(problem, x)
+        om_x, om_y = budget.broadcast_waveform(a, c, Phi_0, T, device.delta, n_peak)
+        return om_x ** 2 + om_y ** 2 - s ** 2
+
+    fun = jax.jit(cone)
+    jac = jax.jit(jax.jacrev(cone))
+
+    if problem.hessian_mode == "gauss_newton":
+        zeros = csr_matrix((n, n))
+
+        def hess(x, v):
+            return zeros
+
+    else:
+        hess = BFGS()
+
+    return NonlinearConstraint(
+        lambda x: np.asarray(fun(jnp.asarray(x))),
+        -np.inf,
+        0.0,
+        jac=lambda x: np.asarray(jac(jnp.asarray(x))),
+        hess=hess,
+    )
+
+
+def budget_manifest_for(problem: BudgetProblem, *, early_stop: EarlyStop | None = None, **extra) -> dict:
+    """Build the manifest dict for a :class:`BudgetProblem`. Pure data.
+
+    Carries the *whole* device (``device.to_manifest()``) verbatim, per
+    ``_plan_full_cost.md`` §3.2's "整份 device 进每个 RunRecord 的 manifest".
+    """
+    man = {
+        "ansatz": dict(problem.ansatz or {}),
+        "M": problem.M,
+        "T": problem.T,
+        "target_gate": dict(problem.target_gate or {"name": "unspecified"}),
+        "N_grid": problem.N_grid,
+        "n_peak": problem.n_peak,
+        "layer": "budget",
+        "gate_level": problem.gate_level,
+        "winding_branch": float(problem.theta),
+        "device": problem.device.to_manifest(),
+        "objective": {
+            "terms": ["c1", "c2", "c3", "c4"],
+            "weights": dict(budget.weights_from_device(problem.device)._asdict()),
+        },
+        "solver": {
+            "method": "trust-constr",
+            "maxiter": problem.maxiter,
+            "fixed_budget_survey": bool(problem.fixed_budget_survey),
+            "hessian_mode": problem.hessian_mode,
+            "gtol": problem.gtol,
+            "xtol": problem.xtol,
+            "checkpoint_every": problem.checkpoint_every,
+            "early_stop": (None if early_stop is None else early_stop._asdict()),
+        },
+    }
+    man.update(extra)
+    return man
+
+
+def reevaluate_budget(
+    coeffs_a, coeffs_c, Phi_0: float, phi_vz: float, T: float,
+    device: Device = DEFAULT_DEVICE, grids=FINE_GRIDS, theta: float | None = None,
+    gate_level: str = "three_level",
+) -> dict:
+    """Re-evaluate the gate residual and budget terms on finer grids -- mandatory for a claim.
+
+    Only the parts that actually depend on the grid are re-run per grid
+    (the gate residual, at the given *gate_level*); the budget terms are
+    reported per grid too since C4/the design-curve integrals also carry an
+    ``O(dt^2)`` quadrature error.
+    """
+    a = np.asarray(coeffs_a, dtype=float)
+    c = np.asarray(coeffs_c, dtype=float)
+    U_target = propagate.target_x(np.pi if theta is None else theta)
+    out = {"layer": "budget", "gate_level": gate_level, "grids": {}}
+    for N in grids:
+        terms = budget.budget_terms(a, c, Phi_0, T, device, N)
+        om_x, om_y = budget.broadcast_waveform(a, c, Phi_0, T, device.delta, N)
+        if gate_level == "three_level":
+            U3 = gate.three_level_propagator(om_x, om_y, T, device.delta)
+            gate_res, _W, P = gate.polar_gate_residual(U3, U_target, phi_vz)
+            margin = float(gate.polar_margin(gate.qubit_block(U3)))
+        else:
+            chain2 = propagate.chain(om_x, om_y, T)
+            target = gate.rz(phi_vz) @ jnp.asarray(U_target, dtype=jnp.complex128)
+            gate_res = propagate.gate_residual(chain2.U_edge[-1], target)
+            margin = None
+        out["grids"][str(N)] = {
+            "c1": float(terms.c1),
+            "c2": float(terms.c2),
+            "c3": float(terms.c3),
+            "c4": float(terms.c4),
+            "total": float(terms.total),
+            "gate_residual_max": float(np.max(np.abs(np.asarray(gate_res)))),
+            "polar_margin": margin,
+            "peak_phys": float(np.max(np.hypot(np.asarray(om_x), np.asarray(om_y)))),
+        }
+    return out
+
+
+def solve_budget(
+    problem: BudgetProblem,
+    *,
+    recorder=None,
+    early_stop: EarlyStop | None = None,
+    fine_grids=FINE_GRIDS,
+    verbose: int = 0,
+) -> BudgetSolveResult:
+    """Run one F04 budget-mode optimization: min C1+C2+C3+C4 s.t. G, P, peak.
+
+    Mirrors :func:`solve`'s shape (assemble scipy objects, call trust-constr,
+    checkpoint through *recorder* if given -- see the module-level "F04"
+    section docstring for why recorder integration is a no-op today unless
+    the caller supplies one with a compatible ``append``/``close``) but is
+    otherwise a fresh implementation: the free-parameter set, constraint set
+    and objective are all different from :func:`solve`'s (section docstring).
+    """
+    if problem.hessian_mode not in HESSIAN_MODES:
+        raise ValueError(f"hessian_mode must be one of {HESSIAN_MODES}")
+    if problem.gate_level not in GATE_LEVELS:
+        raise ValueError(f"gate_level must be one of {GATE_LEVELS}, got {problem.gate_level!r}")
+
+    x0 = _budget_x0(problem)
+    bounds = _budget_bounds(problem)
+    fun, jac, hess = _budget_objective(problem)
+    constraints = [
+        _budget_gate_constraint(problem),
+        _budget_c1_constraint(problem),
+        _budget_peak_constraint(problem),
+    ]
+
+    objective_kwargs = (
+        {"jac": jac, "hess": hess}
+        if problem.hessian_mode in ("gauss_newton", "objective_only")
+        else {"jac": jac, "hess": BFGS()}
+    )
+
+    U_target = propagate.target_x(problem.theta)
+
+    def evaluate(x):
+        a, c, Phi_0, phi_vz, s = _split_budget(problem, x)
+        terms = budget.budget_terms(a, c, Phi_0, problem.T, problem.device, problem.N_grid)
+        om_x, om_y = budget.broadcast_waveform(
+            a, c, Phi_0, problem.T, problem.device.delta, problem.N_grid
+        )
+        if problem.gate_level == "three_level":
+            U3 = gate.three_level_propagator(om_x, om_y, problem.T, problem.device.delta)
+            gate_res, _W, _P = gate.polar_gate_residual(U3, U_target, phi_vz)
+            margin = float(gate.polar_margin(gate.qubit_block(U3)))
+        else:
+            chain2 = propagate.chain(om_x, om_y, problem.T)
+            target = gate.rz(phi_vz) @ jnp.asarray(U_target, dtype=jnp.complex128)
+            gate_res = propagate.gate_residual(chain2.U_edge[-1], target)
+            margin = None
+        c1_res = np.array(
+            [
+                float(basis.c1_row(problem.M, problem.T, "start") @ np.asarray(a)),
+                float(basis.c1_row(problem.M, problem.T, "end") @ np.asarray(a)),
+            ]
+        )
+        return terms, np.asarray(gate_res), c1_res, margin
+
+    state = {"n": 0, "checkpoints": 0, "stalled": 0, "prev": None, "early": False}
+
+    def callback(xk, res=None):
+        state["n"] += 1
+        terms, gate_res, _c1_res, _margin = evaluate(xk)
+        total = float(terms.total)
+
+        if recorder is not None and (state["n"] - 1) % problem.checkpoint_every == 0:
+            a, c, Phi_0, phi_vz, s = _split_budget(problem, xk)
+            recorder.append(
+                state["n"] - 1,
+                np.asarray(a),
+                np.asarray(c),
+                cost_total=total,
+                cost_c1=float(terms.c1),
+                cost_c2=float(terms.c2),
+                cost_c3=float(terms.c3),
+                cost_c4=float(terms.c4),
+                res_gate=float(np.max(np.abs(gate_res))),
+            )
+            state["checkpoints"] += 1
+
+        if early_stop is not None:
+            prev = state["prev"]
+            if prev is not None:
+                improvement = abs(prev - total) / max(abs(prev), 1e-300)
+                state["stalled"] = state["stalled"] + 1 if improvement < early_stop.tol else 0
+            state["prev"] = total
+            if state["stalled"] >= early_stop.patience:
+                state["early"] = True
+                return True
+        return False
+
+    t_start = time.perf_counter()
+    res = minimize(
+        fun,
+        x0,
+        method="trust-constr",
+        bounds=bounds,
+        constraints=constraints,
+        callback=callback,
+        options={
+            "maxiter": problem.maxiter,
+            "gtol": problem.gtol,
+            "xtol": problem.xtol,
+            "verbose": verbose,
+        },
+        **objective_kwargs,
+    )
+    wall = time.perf_counter() - t_start
+
+    if state["early"]:
+        stop_reason = "early_stop"
+    elif res.status in (1, 2):
+        stop_reason = "converged"
+    elif res.nit >= problem.maxiter or res.status == 0:
+        stop_reason = "maxiter"
+    else:
+        stop_reason = "failed"
+
+    a, c, Phi_0, phi_vz, s = _split_budget(problem, res.x)
+    terms, gate_res, c1_res, margin = evaluate(res.x)
+    # ★ same grid the peak epigraph constraint was built on (n_peak, not
+    # N_grid): metrics.peak's docstring documents why this must match --
+    # the constrained grid's maximum under-reports the continuum maximum by
+    # O(dt^2), so reporting on a *finer* grid than the constraint used can
+    # show an apparent (grid-resolution, not physical) overshoot of Omega_max.
+    om_x_peak, om_y_peak = budget.broadcast_waveform(
+        a, c, Phi_0, problem.T, problem.device.delta, problem.n_peak
+    )
+    peak_phys = float(np.max(np.hypot(np.asarray(om_x_peak), np.asarray(om_y_peak))))
+
+    out = BudgetSolveResult(
+        coeffs_a=np.asarray(a),
+        coeffs_c=np.asarray(c),
+        Phi_0=float(Phi_0),
+        phi_vz=float(phi_vz),
+        s=float(s),
+        stop_reason=stop_reason,
+        status=int(res.status),
+        nit=int(res.nit),
+        wall_clock_s=wall,
+        terms=terms,
+        gate_residual=gate_res,
+        c1_residual=c1_res,
+        peak_phys=peak_phys,
+        polar_margin=margin,
+        scipy_message=str(res.message),
+        fixed_budget_survey=bool(problem.fixed_budget_survey),
+    )
+
+    if recorder is not None:
+        recorder.close(
+            status=stop_reason,
+            nit=out.nit,
+            wall_clock_s=wall,
+            scipy_status=out.status,
+            scipy_message=out.scipy_message,
+            gate_residual=out.gate_residual.tolist(),
+            c1_residual=out.c1_residual.tolist(),
+            peak_phys=out.peak_phys,
+            polar_margin=out.polar_margin,
             terms=out.terms._asdict(),
             void_for_claims=out.void_for_claims,
         )

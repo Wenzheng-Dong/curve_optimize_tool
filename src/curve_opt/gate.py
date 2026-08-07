@@ -81,12 +81,15 @@ second matrix inversion.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from curve_opt.propagate import gate_residual as _su2_gate_residual
 from curve_opt.propagate import su2_rotation
 
 __all__ = [
+    "DRIVE_X3",
+    "DRIVE_Y3",
     "gate_residual_vector",
     "leakage_population",
     "polar_decompose",
@@ -94,6 +97,8 @@ __all__ = [
     "polar_margin",
     "qubit_block",
     "rz",
+    "three_level_bare",
+    "three_level_propagator",
 ]
 
 
@@ -199,3 +204,93 @@ def polar_gate_residual(U3, U_target, phi_vz):
     W, P = polar_decompose(B)
     residual = gate_residual_vector(W, U_target, phi_vz)
     return residual, W, P
+
+
+# --------------------------------------------------------------------------
+# F04 addition: a JAX-differentiable three-level propagator
+# --------------------------------------------------------------------------
+# ``curve_opt.novera.three_level_gate`` (F03) is the reference three-level
+# simulation, but it is a plain-numpy loop over ``scipy.linalg.expm`` (see its
+# docstring / upstream ``db_transmon.three_level_gate``) -- opaque to
+# ``jax.grad``. F04's hard gate constraint needs an analytic Jacobian of
+# :func:`polar_gate_residual` with respect to the pulse coefficients for
+# ``trust-constr``, so this module adds its own three-level midpoint chain,
+# built the same way :func:`curve_opt.propagate.chain` builds the two-level
+# one (piecewise-constant cells at their midpoint value,
+# ``jax.lax.associative_scan`` for the ordered product, newest on the left --
+# the same numerical contract), but with ``jax.scipy.linalg.expm`` standing in
+# for the closed-form ``sinc`` rewrite: no 2x2-style closed form exists for a
+# driven three-level ladder, and unlike the two-level ``1/|Omega|`` division
+# ``expm`` has no coordinate singularity at zero drive, so no guard is needed.
+# Cross-checked against :func:`curve_opt.novera.three_level_gate` in
+# ``tests/test_f04_budget.py`` -- a genuinely independent numpy/scipy
+# reference on a differently-discretized grid (edge-averaged vs midpoint), so
+# agreement is only approximate, the same caveat F01/F03 already documented
+# for ``leakage_amplitude`` vs Novera's own.
+#
+# The Hamiltonian matches ``db_transmon`` term for term (git hash
+# ``59fb616``): ``H = diag(0, 0, delta) + Omega_x DRIVE_X + Omega_y DRIVE_Y``
+# with the ladder operator ``a`` such that ``a|1> = |0>``, ``a|2> =
+# sqrt(2)|1>``. Deliberately *no* static detuning, amplitude scale or frame
+# rotation term: those are ``db_transmon``'s *calibration* knobs
+# (``_calibration_terms``), not part of the nominal design Hamiltonian G is
+# measured against (``delta = curve_opt.device.Device.delta``, the
+# anharmonicity -- the noise moments delta_z, epsilon enter only through
+# C1/C3's *weights* in :mod:`curve_opt.budget`, never through this
+# propagator).
+
+_LOWER3 = jnp.array(
+    [[0.0, 1.0, 0.0], [0.0, 0.0, jnp.sqrt(2.0)], [0.0, 0.0, 0.0]], dtype=jnp.complex128
+)
+#: ``H_drive = Omega_x * DRIVE_X3 + Omega_y * DRIVE_Y3`` -- matches
+#: ``db_transmon.DRIVE_X`` / ``DRIVE_Y`` term for term (``_LOWER3`` is real, so
+#: ``.conj().T`` and ``.T`` agree here).
+DRIVE_X3 = 0.5 * (_LOWER3 + jnp.conj(_LOWER3).T)
+DRIVE_Y3 = 0.5j * (jnp.conj(_LOWER3).T - _LOWER3)
+
+
+def three_level_bare(delta) -> jnp.ndarray:
+    """``diag(0, 0, delta)`` -- the undriven three-level Hamiltonian.
+
+    ``delta`` is the anharmonicity (``curve_opt.device.Device.delta``), not
+    the static-detuning noise moment -- see the section docstring above.
+    """
+    return jnp.diag(jnp.stack([0.0 * delta, 0.0 * delta, delta]).astype(jnp.complex128))
+
+
+def _three_level_cell_propagators(om_x, om_y, delta, dt: float) -> jnp.ndarray:
+    """``exp(-i dt H(Omega_x_k, Omega_y_k))`` per cell, shape ``(N, 3, 3)``.
+
+    ``jax.scipy.linalg.expm`` in place of :mod:`curve_opt.propagate`'s closed
+    ``sinc`` form (section docstring): no ``|Omega| = 0`` guard is needed here
+    because ``expm`` has no coordinate singularity at zero drive (unlike the
+    ``1 / |Omega|`` division the two-level closed form removes).
+    """
+    om_x = jnp.asarray(om_x, dtype=jnp.float64)
+    om_y = jnp.asarray(om_y, dtype=jnp.float64)
+    H = (
+        three_level_bare(delta)[None, :, :]
+        + om_x[:, None, None] * DRIVE_X3[None, :, :]
+        + om_y[:, None, None] * DRIVE_Y3[None, :, :]
+    )
+    return jax.vmap(lambda h: jax.scipy.linalg.expm(-1j * h * dt))(H)
+
+
+def three_level_propagator(om_x_mid, om_y_mid, T: float, delta) -> jnp.ndarray:
+    """``U_3(T)``, shape ``(3, 3)``, from midpoint samples of the broadcast waveform.
+
+    Same "newest on the left" contract as :func:`curve_opt.propagate.chain`
+    (that module's numerical-contract discipline): ``associative_scan``
+    combines batches of ``(3, 3)`` propagators with the later step on the
+    left. Only the final propagator is returned -- G only ever needs
+    ``U_3(T)``, not the intermediate trajectory the two-level chain keeps for
+    the space curve.
+    """
+    om_x = jnp.asarray(om_x_mid, dtype=jnp.float64)
+    om_y = jnp.asarray(om_y_mid, dtype=jnp.float64)
+    N = om_x.shape[0]
+    dt = T / N
+    steps = _three_level_cell_propagators(om_x, om_y, delta, dt)
+    # ★ newest on the left, same contract as propagate.chain's U_edge scan.
+    U_edge = jax.lax.associative_scan(lambda A, B: jnp.einsum("kij,kjl->kil", B, A), steps)
+    return U_edge[-1]
