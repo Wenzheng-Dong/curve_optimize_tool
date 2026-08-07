@@ -155,13 +155,23 @@ class Device:
 
     @property
     def decoherence_floor(self) -> float:
-        """``(Gamma1 + Gamma_phi) * T`` -- the waveform-independent infidelity floor.
+        """Average-gate-infidelity floor from decoherence, waveform-independent.
+
+        ``(Gamma1 + Gamma_phi) * T`` is the *population-decay probability*,
+        not the average gate infidelity: for a ``d``-level system those
+        differ by a factor ``d(d+1)/2`` (Nielsen's average-fidelity formula),
+        which for a qubit (``d = 2``) is 3. The correct floor is therefore
+        ``(Gamma1 + Gamma_phi) * T / 3``.
 
         ``T`` is fixed, so this term never enters the optimization; it is a
         constant added to the total account (``_plan_full_cost.md`` §0, §2.5).
-        Expect ``1.25e-3``.
+        Five independent routes agree on this value (hand-derived Kraus map,
+        4-Pauli tomography, ``qutip.average_gate_fidelity``, an independent
+        QuTiP idle-channel check, and pure amplitude damping ``Gamma1*T/3``);
+        see ``_dev_logs/F07_end_to_end.md`` and ``_plan_full_cost.md`` §0.
+        Expect ``4.1667e-4``.
         """
-        return (self.gamma1 + self.gamma_phi) * self.gate_time
+        return (self.gamma1 + self.gamma_phi) * self.gate_time / 3.0
 
     @property
     def resonant_harmonic(self) -> float:
