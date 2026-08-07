@@ -92,7 +92,7 @@ import numpy as np
 from scipy.optimize import BFGS, Bounds, LinearConstraint, NonlinearConstraint, minimize
 from scipy.sparse import csr_matrix
 
-from curve_opt import basis, budget, gate, geometry, metrics, propagate
+from curve_opt import basis, budget, gate, geometry, metrics, novera, propagate
 from curve_opt.device import DEFAULT_DEVICE, Device
 
 __all__ = [
@@ -822,18 +822,15 @@ def solve(
 # the general shape of "assemble scipy objects, call trust-constr". See
 # ``_dev_logs/F04_budget_objective.md`` for the alternative considered.
 #
-# Recorder integration is **not** wired up here: :mod:`curve_opt.recorder`'s
-# schema (``HISTORY_COLUMNS`` = ``cost_energy``/``cost_curv``/``cost_peak``,
-# ``res_closure``/``res_area``) is energy-era-specific, and
-# ``verify_history`` recomputes those columns through
-# :func:`curve_opt.metrics.cost_terms` -- a budget-mode run's checkpoints
-# (``cost_c1``..``cost_c4``, a gate-only residual) do not fit that contract,
-# and the task brief's F04 deliverable list does not include
-# ``recorder.py``. Flagged for leader disposition rather than silently
-# reshoehorned into the existing schema; :func:`solve_budget` still accepts
-# an optional *recorder* and will use it if the caller passes one whose
-# ``append``/``close`` happen to accept the extra keyword terms this module
-# provides, but no existing ``Recorder`` does today.
+# Recorder integration (F05-pre): :func:`solve_budget`'s callback calls
+# :meth:`curve_opt.recorder.Recorder.append_budget`, the ``schema_version`` 2
+# writer added alongside the energy-era ``append`` rather than folded into it
+# -- the two histories do not share a row shape (``coeffs_a``/``coeffs_c`` vs
+# ``coeffs_a``/``coeffs_b``, ``cost_c1``..``cost_c4`` vs
+# ``cost_energy``/``cost_curv``/``cost_peak``). A caller wanting a run on disk
+# must construct ``Recorder(run_id, budget_manifest_for(problem), schema="budget")``;
+# passing an energy-schema ``Recorder`` here raises (``append_budget`` checks
+# ``self.schema``), rather than silently writing the wrong columns.
 
 GATE_LEVELS = ("three_level", "two_level")
 
@@ -1117,6 +1114,21 @@ def budget_manifest_for(problem: BudgetProblem, *, early_stop: EarlyStop | None 
 
     Carries the *whole* device (``device.to_manifest()``) verbatim, per
     ``_plan_full_cost.md`` §3.2's "整份 device 进每个 RunRecord 的 manifest".
+
+    ``layer`` is ``"general"``: :class:`BudgetProblem`'s design curve is
+    always the full ``(a, c, Phi_0)`` parametrization of
+    :mod:`curve_opt.parametrization` (:func:`curve_opt.budget.design_chain`
+    calls :func:`curve_opt.parametrization.design_curve` unconditionally, not
+    a ``c = 0``-restricted variant), so it is the same design-curve layer
+    :class:`Problem`'s general layer names, not a fourth thing. F05-pre
+    corrects this from the F04 placeholder ``"budget"`` -- no test asserted
+    on that value (module-scope search), and the recorder's
+    :data:`curve_opt.recorder.REQUIRED_MANIFEST_KEYS_BUDGET` now requires
+    ``layer`` to say which readout family the run used, not which objective.
+    ``novera_git_hash`` is F03's pinned upstream reference
+    (:data:`curve_opt.novera.UPSTREAM_GIT_HASH`), promised into the manifest
+    by that module's own docstring ("F04 wires it in") but not actually
+    wired until here.
     """
     man = {
         "ansatz": dict(problem.ansatz or {}),
@@ -1125,10 +1137,11 @@ def budget_manifest_for(problem: BudgetProblem, *, early_stop: EarlyStop | None 
         "target_gate": dict(problem.target_gate or {"name": "unspecified"}),
         "N_grid": problem.N_grid,
         "n_peak": problem.n_peak,
-        "layer": "budget",
+        "layer": "general",
         "gate_level": problem.gate_level,
         "winding_branch": float(problem.theta),
         "device": problem.device.to_manifest(),
+        "novera_git_hash": novera.UPSTREAM_GIT_HASH,
         "objective": {
             "terms": ["c1", "c2", "c3", "c4"],
             "weights": dict(budget.weights_from_device(problem.device)._asdict()),
@@ -1255,12 +1268,12 @@ def solve_budget(
 
     def callback(xk, res=None):
         state["n"] += 1
-        terms, gate_res, _c1_res, _margin = evaluate(xk)
+        terms, gate_res, c1_res, _margin = evaluate(xk)
         total = float(terms.total)
 
         if recorder is not None and (state["n"] - 1) % problem.checkpoint_every == 0:
             a, c, Phi_0, phi_vz, s = _split_budget(problem, xk)
-            recorder.append(
+            recorder.append_budget(
                 state["n"] - 1,
                 np.asarray(a),
                 np.asarray(c),
@@ -1269,7 +1282,11 @@ def solve_budget(
                 cost_c2=float(terms.c2),
                 cost_c3=float(terms.c3),
                 cost_c4=float(terms.c4),
-                res_gate=float(np.max(np.abs(gate_res))),
+                Phi_0=float(Phi_0),
+                phi_vz=float(phi_vz),
+                res_gate=np.asarray(gate_res),
+                res_c1_ends=c1_res,
+                epigraph_s=float(s),
             )
             state["checkpoints"] += 1
 
