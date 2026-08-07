@@ -5,13 +5,13 @@ is the "new" choice, kept separate because it is the full-cost era's own
 acceptance gate and pulls in the Novera cross-check machinery
 ``test_propagate.py`` does not need).
 
-★ Read this file's bottom section (``KNOWN ISSUE``) before trusting a
-green run at face value: two of the F01 acceptance criteria (grid convergence
-and the Novera cross-check, both at *non-planar* points) are blocked by a
+Two of the F01 acceptance criteria (grid convergence and the Novera
+cross-check, both at *non-planar* points) were originally blocked by a
 pre-existing bug in :func:`curve_opt.propagate.chain`'s ``U_mid`` construction,
-discovered while writing this file. See ``_dev_logs/F01_forward_chain.md`` for
-the full diagnosis; the affected tests are marked ``xfail`` with a pointer
-back to this comment rather than silently weakened.
+discovered while writing this file (``_dev_logs/F01_forward_chain.md`` §0) and
+fixed in F01b (``_dev_logs/F01b_umid_order.md``): both tests below now assert
+the full O(dt^2) / O(dt^2)-at-4x criteria that F01 could only state as known
+issues.
 """
 
 from __future__ import annotations
@@ -232,8 +232,9 @@ def test_leakage_amplitude_matches_quad_for_a_single_sine_mode():
 
 
 # --------------------------------------------------------------------------
-# Grid convergence (criterion (3)) -- planar/collinear inputs only. See the
-# module docstring's KNOWN ISSUE: non-planar convergence is blocked upstream.
+# Grid convergence (criterion (3)) -- planar/collinear inputs, plus one
+# genuinely non-commuting case further down (fixed in F01b; see that test's
+# own docstring).
 # --------------------------------------------------------------------------
 
 
@@ -281,23 +282,11 @@ def test_leakage_amplitude_ddelta_converges_second_order_on_a_planar_case():
     assert order == pytest.approx(2.0, abs=0.15), (Ns, errs, order)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "KNOWN UPSTREAM BUG (not F01's formulas): propagate.chain()'s U_mid = "
-        "U_left @ half_step has the multiplication order reversed relative to "
-        "this project's own 'newest on the left' convention (see the module "
-        "docstring and _dev_logs/F01_forward_chain.md). Invisible for "
-        "commuting (planar/collinear) fields -- every other test in this file "
-        "uses those -- but for genuinely non-commuting drives it degrades "
-        "U_mid, and everything built on it (tangent, area, closure, and this "
-        "function), from O(dt^2) to O(dt). Verified fix: swap to "
-        "`half_step @ U_left`; not applied here because it touches pre-F01, "
-        "widely depended-on code outside this step's scope. Reported to "
-        "leader, not patched unilaterally."
-    ),
-    strict=True,
-)
 def test_tantrix_area_convergence_on_a_genuinely_noncommuting_case():
+    """Fixed in F01b: was ``xfail(strict=True)`` (O(dt), not O(dt^2)) because
+    ``propagate.chain()``'s ``U_mid`` carried a reversed multiplication order
+    on non-commuting inputs -- see ``_dev_logs/F01b_umid_order.md``.
+    """
     M = 8
     a = rng(31).normal(size=M) * 3.0
     b = rng(32).normal(size=M) * 2.0
@@ -472,17 +461,21 @@ def test_novera_cross_check_planar(name, a, b):
 
 
 @requires_novera
-def test_novera_cross_check_noncommuting_reports_the_known_degradation():
-    """Same comparison on a non-commuting drive.
+def test_novera_cross_check_noncommuting():
+    """Same comparison as :func:`test_novera_cross_check_planar`, non-commuting drive.
 
-    ★ Per the module docstring's KNOWN ISSUE, the *difference* between our
-    scheme and Novera's does not shrink at the same 4x-per-4x-refinement rate
-    here, because our own U_mid carries the pre-existing O(dt) bug on
-    non-commuting inputs -- Novera's own edge-averaged scheme does not share
-    that bug (confirmed independently in the diagnosis). This test does not
-    assert O(dt^2) convergence; it only pins the leading-order agreement
-    (magnitude, phase) that does not depend on it, and prints the residual so
-    a future fix's effect is visible in the pytest output.
+    Fixed in F01b (``_dev_logs/F01b_umid_order.md``): before the U_mid ordering
+    fix, the *difference* between our scheme and Novera's did not shrink at the
+    expected 4x-refinement rate here, because our own ``U_mid`` carried the
+    pre-existing O(dt) bug on non-commuting inputs (Novera's edge-averaged
+    scheme never shared it). Post-fix this asserts the same tier as the planar
+    case: ``rel_mag < 2e-3``, phase to ``1e-4``, and >= 3x shrink (of a
+    measured ~16x) on 4x grid refinement. The base grid here (8000 vs planar's
+    2000) is larger than the planar test's, not because the tolerance is
+    looser, but because the scheme-difference constant between our midpoint
+    quadrature and Novera's trapezoid rule is itself larger for this
+    highly non-commuting, large-amplitude M=12 case (noncommutativity ~9.3e4
+    vs exactly 0 for the planar case) -- both grids already clear the bound.
     """
     M = 12
     a = rng(50).normal(size=M) * 3.0
@@ -495,16 +488,17 @@ def test_novera_cross_check_noncommuting_reports_the_known_degradation():
     def om_y_fn(t):
         return basis.omega(b, t, T)
 
-    N = 8000
-    novera_amp = _novera_style_amplitude(om_x_fn, om_y_fn, T, DELTA, N)
-    lam = np.asarray(propagate.leakage_amplitude_of_coeffs(a, b, T, DELTA, N=N))
-    L0 = lam[0] + 1j * lam[1]
-    predicted = -1j * L0
-    rel_mag = abs(abs(novera_amp) - abs(predicted)) / abs(predicted)
-    phase_diff = float(np.angle(novera_amp / L0))
-    print(f"\n[F01 known-issue] non-commuting Novera cross-check at N={N}: "
-          f"rel_mag_diff={rel_mag:.3e} phase_diff={phase_diff:.6f} "
-          f"(target -pi/2={-np.pi/2:.6f})")
-    # Loose bounds: leading-order agreement only, see the docstring above.
-    assert rel_mag < 0.05
-    assert phase_diff == pytest.approx(-np.pi / 2.0, abs=0.05)
+    prev_diff = None
+    for N in (8000, 32000):  # 4x refinement
+        novera_amp = _novera_style_amplitude(om_x_fn, om_y_fn, T, DELTA, N)
+        lam = np.asarray(propagate.leakage_amplitude_of_coeffs(a, b, T, DELTA, N=N))
+        L0 = lam[0] + 1j * lam[1]
+        predicted = -1j * L0
+        rel_mag = abs(abs(novera_amp) - abs(predicted)) / abs(predicted)
+        phase_diff = float(np.angle(novera_amp / L0))
+        diff = abs(novera_amp - predicted)
+        assert rel_mag < 2e-3
+        assert phase_diff == pytest.approx(-np.pi / 2.0, abs=1e-4)
+        if prev_diff is not None:
+            assert diff < prev_diff / 3.0  # expect ~16x at 4x refinement; 3x is a safe floor
+        prev_diff = diff

@@ -20,6 +20,21 @@ Therefore: **any new propagator code must pass a non-commuting case plus an
 independent second implementation (numpy / qutip) before use.** A planar case
 does not count as that gate.
 
+★ This contract binds ``U_mid`` exactly as much as it binds the ``U_edge``
+scan -- ``U_mid[k]`` is ``(half step at cell k) @ U_left[k]``, half step
+(later) on the left. From Step 11 through F01, ``chain()`` had this backwards
+(``U_left @ half_step``), degrading ``U_mid`` -- and everything built from it
+(``tangent``, ``r_mid``, ``closure``, ``area``, F01's ``tantrix_area`` /
+``leakage_amplitude``) -- from O(dt^2) to O(dt) on any genuinely non-commuting
+input, while being byte-identical on planar/collinear inputs (where it commutes
+and the order does not matter). It went undetected because the only existing
+``U_mid`` test (``test_every_propagator_is_unitary``) checks unitarity, and
+``U_1 U_2`` is exactly as unitary as ``U_2 U_1`` for unitary ``U_1, U_2`` --
+that check cannot see an ordering error at all. Fixed and regression-tested in
+F01b (see ``_dev_logs/F01b_umid_order.md``); the ``U_edge`` scan itself was
+always correct, which is why endpoint-only quantities (``propagator()``,
+``gate_residual`` on planar/general layers alike) were never affected.
+
 Time stepping uses the same midpoint rule as :mod:`curve_opt.geometry`. Float64
 is enabled process-wide by importing :mod:`curve_opt` (JAX defaults to float32,
 and every residual claim here lives at 1e-16).
@@ -42,7 +57,8 @@ with ``|Omega| ~ 0`` occur on the way to every solution, and an
 gradient.
 
 Edge and midpoint propagators come from one scan: ``U_edge`` is the scan over
-full steps, and ``U_mid = U_edge[k-1] @ (half step)``. The space curve then
+full steps, and ``U_mid = (half step) @ U_edge[k-1]`` (half step, being later in
+time, on the left -- see the ordering contract above). The space curve then
 follows the same midpoint quadrature as the planar layer, applied to the Bloch
 components of ``U^dagger sigma_z U``.
 
@@ -253,7 +269,11 @@ def chain(om_x_mid, om_y_mid, T: float) -> Chain3D:
     # which is invisible unless the case is non-commuting (_plan.md §6.3).
     U_edge = jax.lax.associative_scan(lambda A, B: B @ A, steps)
     U_left = jnp.concatenate([I2[None], U_edge[:-1]])
-    U_mid = U_left @ _cell_propagators(om_x, om_y, dt, 0.5)
+    # ★ same "newest on the left" contract as U_edge above: the half-step (later
+    # in time) goes on the left of U_left (earlier). Reversed order was a
+    # pre-existing (Step 11) bug -- see F01b's dev log and the module docstring's
+    # "Numerical contract" section for the O(dt) -> O(dt^2) diagnosis.
+    U_mid = _cell_propagators(om_x, om_y, dt, 0.5) @ U_left
 
     # Bloch components of U^dagger sigma_z U at the midpoints: the space curve's
     # unit tangent, same object the planar layer builds by trigonometry.
