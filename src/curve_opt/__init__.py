@@ -25,9 +25,12 @@ jax.config.update("jax_enable_x64", True)
 
 __version__ = "0.1.0"
 
-#: Module names of the architecture in ``_plan.md`` §4.1, in dependency order
-#: (input layer -> core -> optimize/record -> presentation).
+#: Module names of the architecture in ``_plan.md`` §4.1 / ``_plan_full_cost.md``
+#: §4.4, in dependency order (input layer -> core -> optimize/record ->
+#: presentation). ``device`` is the lowest level (F01): it depends on nothing
+#: and everything physical depends on it.
 MODULES = (
+    "device",
     "basis",
     "geometry",
     "propagate",
