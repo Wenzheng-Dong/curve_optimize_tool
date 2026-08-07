@@ -7,19 +7,31 @@ Four acceptance criteria (task brief §3) plus one structural self-check (task b
      a c1-satisfying ``a`` gives an endpoint <= 1e-12.
  (3) kappa -> -kappa, Phi -> Phi + pi leaves the broadcast waveform invariant to <= 1e-14.
  (4) Gaussian + DRAG (raw samples, tau = 0) reproduces the textbook Omega_y = -Omega_x_dot /
-     Delta and the Stark-shift Phi_dot_prog = kappa^2 / (2 Delta), checked against a reference
+     Delta and the Stark-shift Phi_dot_prog = -kappa^2 / (2 Delta), checked against a reference
      computed independently in this file (not by calling back into parametrization.py's own
      formula).
  (structural) ``general_waveform`` at ``c = 0, Phi_0 = 0`` matches ``planar_drag_waveform`` bit
      for bit (<= 1e-14) -- the three layers share one code path.
+
+★ (5, added 2026-08-07, F05-redo) A *non-circular* check of the Stark-reprogramming sign
+    (AGENTS.md's "quality guardrails" §5th entry, the postmortem of the 2026-08-07 sign bug).
+    Criterion (4) above is a *circular* check for this particular sign: its reference formula
+    was transcribed from the same plan-text expression that the implementation was transcribed
+    from, so when that text carried the wrong sign, both sides were wrong identically and the
+    test stayed green. ``test_stark_coefficient_scan_is_minimized_at_the_derived_sign`` below
+    instead asks a purely physical question that no transcription error can make pass
+    spuriously: run the *actual* three-level propagator on a naive-X(pi)+DRAG waveform, scan
+    an independent (beta, Stark-coefficient) grid, and assert the zero-noise total infidelity
+    is minimized at the theoretically derived point by a wide margin over its neighbours.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
+from scipy.optimize import minimize_scalar
 
-from curve_opt import basis, device, parametrization
+from curve_opt import basis, device, gate, parametrization, propagate
 
 DEV = device.DEFAULT_DEVICE
 T = DEV.gate_time
@@ -160,7 +172,7 @@ def test_gaussian_drag_reproduces_textbook_quadrature_and_stark_phase():
 
     # independent reference formulas, written directly here (not via parametrization.py)
     omega_y_textbook = -kappa_dot_ref / DELTA
-    stark_phase_rate_textbook = kappa**2 / (2.0 * DELTA)
+    stark_phase_rate_textbook = -(kappa**2) / (2.0 * DELTA)
 
     err_quadrature = np.max(np.abs(np.asarray(kappa_y) - omega_y_textbook))
     err_stark = np.max(np.abs(np.asarray(phi_dot_prog) - stark_phase_rate_textbook))
@@ -212,3 +224,110 @@ def test_kappa_dot_analytic_matches_finite_difference_sanity():
     err = np.max(np.abs(kappa_dot_analytic - kappa_dot_fd))
     print(f"F02 (sanity) kappa_dot analytic vs finite-difference max err: {err:.3e}")
     assert err <= 1e-4  # np.gradient is only O(dt^2) accurate; loose bound by design
+
+
+# --------------------------------------------------------------------------
+# (5) ★ non-circular Stark-sign check (2026-08-07, F05-redo; AGENTS.md's 5th
+# quality guardrail: verification must not be circular, and must cover every
+# channel the correction touches). Deliberately does *not* reuse
+# drag_stark_quadratures's kappa_y/Phi_dot_prog split with a single "delta" --
+# beta (DRAG amplitude scale) and the Stark coefficient are varied
+# *independently* here, which the module's own function does not expose, so
+# there is no way this test's grid construction can silently inherit the
+# module's sign.
+# --------------------------------------------------------------------------
+
+
+_PAULIS_4 = (
+    np.eye(2, dtype=complex),
+    np.array([[0, 1], [1, 0]], dtype=complex),
+    np.array([[0, -1j], [1j, 0]], dtype=complex),
+    np.array([[1, 0], [0, -1]], dtype=complex),
+)
+
+
+def _nielsen_avg_gate_fidelity(B: np.ndarray, target: np.ndarray) -> float:
+    """Standard Nielsen average-gate-fidelity formula, leakage counted as population loss.
+
+    Independent of, and unrelated to, the Stark-reprogramming formula under test here -- this
+    is the metric the scan is minimized *against*, not a reference for the quantity being
+    verified. Reimplemented locally (rather than imported) so this test has no dependency on
+    any other script's copy of the same standard formula.
+    """
+    total = 0.0
+    for pauli in _PAULIS_4:
+        rotated = target @ pauli @ target.conj().T
+        total += np.trace(rotated @ B @ pauli @ B.conj().T).real
+    return float((total + 4.0) / 12.0)
+
+
+def _naive_x_pi_drag_infidelity(beta: float, stark_coeff: float, N: int = 2000) -> float:
+    """Zero-noise total infidelity of a naive-X(pi) waveform under a (beta, stark_coeff) readout.
+
+    Builds the broadcast waveform directly from the design-curve samples (not through
+    :func:`parametrization.drag_stark_quadratures`, which only exposes a single ``delta`` and
+    cannot vary the DRAG amplitude and the Stark phase independently) -- ``beta`` scales the
+    ``kappa_y`` DRAG quadrature, ``stark_coeff`` scales the ``kappa^2 / (2 Delta)`` phase term
+    directly (i.e. ``stark_coeff = -1`` is the theoretically derived, corrected sign;
+    ``stark_coeff = +1`` is the 2026-08-07 bug). Runs the actual three-level propagator
+    (``curve_opt.gate``) -- not a perturbative shortcut -- and calibrates ``phi_vz`` (the free
+    virtual-Z knob the gate condition already allows) before reporting ``1 - Fbar``.
+    """
+    # min-norm c1 projection, then rescaled back to theta = pi exactly (module docstring's
+    # helper _project_onto_c1 alone does not preserve the gate angle -- see
+    # c1_project_and_rescale's docstring pattern in _dev_logs/F05_budget_validation.py; without
+    # the rescale this test's gate-angle residual (~1e-5) drowns out the ~1e-6 sign signal it
+    # is trying to measure)
+    a_proj = _project_onto_c1(basis.naive_coeffs(np.pi, T, M), T)
+    a = a_proj * (np.pi / basis.gate_angle(a_proj, T))
+    curve = parametrization.design_curve(a, np.zeros(M), 0.0, T, N)
+    kappa, kappa_dot, dt = curve.kappa, curve.kappa_dot, curve.dt
+
+    kappa_y = -beta * kappa_dot / DELTA
+    phi_dot_prog = stark_coeff * (kappa**2) / (2.0 * DELTA)
+    Phi_prog = parametrization._midpoint_cumulative(phi_dot_prog, dt)
+    envelope = (kappa + 1j * kappa_y) * np.exp(1j * np.asarray(Phi_prog))
+    om_x, om_y = np.real(envelope), np.imag(envelope)
+
+    U3 = np.asarray(gate.three_level_propagator(om_x, om_y, T, DELTA, delta_z=0.0))
+    B = np.asarray(gate.qubit_block(U3))
+    U_target = np.asarray(propagate.target_x(np.pi))
+
+    def neg_fid(phi):
+        rz = np.array(
+            [[np.exp(-1j * phi / 2), 0.0], [0.0, np.exp(1j * phi / 2)]], dtype=complex
+        )
+        return -_nielsen_avg_gate_fidelity(B, rz @ U_target)
+
+    res = minimize_scalar(neg_fid, bounds=(-np.pi, np.pi), method="bounded", options={"xatol": 1e-13})
+    return 1.0 - (-res.fun)
+
+
+def test_stark_coefficient_scan_is_minimized_at_the_derived_sign():
+    """Physical, non-circular criterion: total infidelity is minimized at (beta, stark) = (1, -1).
+
+    No formula transcribed from the plan text is used anywhere in this test (module docstring
+    §5) -- the assertion is purely "the physically correct point is the best point on the
+    grid, by a wide margin", which a matching sign error on both sides of a comparison cannot
+    fake.
+    """
+    betas = [0.0, 0.5, 1.0, 1.5]
+    starks = [-2.0, -1.0, 0.0, 1.0, 2.0]
+
+    grid = {(b, s): _naive_x_pi_drag_infidelity(b, s) for b in betas for s in starks}
+    for (b, s), val in sorted(grid.items(), key=lambda kv: kv[1]):
+        print(f"F02 (5) beta={b:.1f} stark={s:+.1f}  1-Fbar={val:.6e}")
+
+    best_point, best_val = min(grid.items(), key=lambda kv: kv[1])
+    print(f"F02 (5) minimum at {best_point}: {best_val:.6e}")
+    assert best_point == (1.0, -1.0)
+
+    neighbours = [
+        grid[(0.5, -1.0)],
+        grid[(1.5, -1.0)],
+        grid[(1.0, 0.0)],
+        grid[(1.0, -2.0)],
+    ]
+    min_neighbour = min(neighbours)
+    print(f"F02 (5) closest neighbour: {min_neighbour:.6e}  ratio={min_neighbour / best_val:.1f}x")
+    assert min_neighbour >= 100.0 * best_val

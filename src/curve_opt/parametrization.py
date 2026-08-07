@@ -65,15 +65,19 @@ at the endpoints, so the ``c1`` guard below only ever needs to constrain ``a``, 
 ::
 
     kappa_y       = -kappa_dot / (Delta + tau)
-    Phi_dot_prog  = tau + kappa^2 / (2 (Delta + tau))
+    Phi_dot_prog  = tau - kappa^2 / (2 (Delta + tau))
     E_out         = (kappa + i kappa_y) exp(i Phi_0 + i int_0^s Phi_dot_prog ds')
 
 ``kappa_y`` is the DRAG leakage-cancelling quadrature; ``Phi_dot_prog`` is the programmed phase
-rate, which includes the AC-Stark shift the drive induces on the 0-1 transition
-(``kappa^2 / (2 (Delta + tau))``) on top of the design heading rate ``tau``. The planar layer is
-the ``tau = 0`` special case: ``kappa_y = -kappa_dot / Delta``, ``Phi_dot_prog = kappa^2 /
-(2 Delta)`` -- the textbook DRAG form, checked independently in
-``tests/test_f02_parametrization.py`` (acceptance ④).
+rate, which *cancels* the AC-Stark shift the drive induces on the 0-1 transition (the SW
+reduction renormalizes the design heading rate to ``tau_eff = tau + kappa^2 / (2 (Delta + tau))``,
+``_plan_full_cost.md`` §2.3a; to cancel that shift the *played* rate must satisfy
+``Phi_dot_prog + kappa^2 / (2 (Delta + tau)) = tau``, hence the minus sign -- §4.1's
+2026-08-07 correction, see also the second-order 1->2 shift ``-Omega^2 / (2 Delta)``, itself
+negative). The planar layer is the ``tau = 0`` special case: ``kappa_y = -kappa_dot / Delta``,
+``Phi_dot_prog = -kappa^2 / (2 Delta)`` -- the textbook DRAG form, checked independently in
+``tests/test_f02_parametrization.py`` (acceptance ④, and the non-circular Stark-coefficient
+scan added 2026-08-07).
 
 ``int_0^s Phi_dot_prog`` is accumulated by the same midpoint cumulative rule as
 :mod:`curve_opt.geometry`'s space curve (:func:`_midpoint_cumulative` below mirrors
@@ -252,8 +256,9 @@ def drag_stark_quadratures(kappa_mid, kappa_dot_mid, tau_mid, delta: float):
     """``(kappa_y, Phi_dot_prog)`` -- the two DRAG/Stark corrections, before phase accumulation.
 
     ``kappa_y = -kappa_dot / (delta + tau)`` is the DRAG leakage-cancelling quadrature;
-    ``Phi_dot_prog = tau + kappa^2 / (2 (delta + tau))`` is the programmed phase rate (design
-    heading rate plus the AC-Stark shift the drive itself induces). Split out from
+    ``Phi_dot_prog = tau - kappa^2 / (2 (delta + tau))`` is the programmed phase rate (design
+    heading rate minus the correction that cancels the AC-Stark shift the drive itself induces --
+    module docstring §2.3's 2026-08-07 sign correction). Split out from
     :func:`readout_waveform` so the two textbook DRAG quantities can be checked directly against
     an independent reference (``tests/test_f02_parametrization.py`` acceptance ④), without also
     exercising the phase-accumulation machinery.
@@ -268,7 +273,7 @@ def drag_stark_quadratures(kappa_mid, kappa_dot_mid, tau_mid, delta: float):
     tau_mid = jnp.asarray(tau_mid)
     denom = delta + tau_mid
     kappa_y = -kappa_dot_mid / denom
-    phi_dot_prog = tau_mid + kappa_mid**2 / (2.0 * denom)
+    phi_dot_prog = tau_mid - kappa_mid**2 / (2.0 * denom)
     return kappa_y, phi_dot_prog
 
 
@@ -351,7 +356,7 @@ def planar_drag_waveform(
     """``planar_drag`` layer: design ``Phi = 0`` (``tau = 0``), DRAG/Stark readout.
 
     The ``tau = 0`` special case of :func:`readout_waveform`: ``kappa_y = -kappa_dot / Delta``,
-    ``Phi_dot_prog = kappa^2 / (2 Delta)`` -- the textbook planar-DRAG form (acceptance ④).
+    ``Phi_dot_prog = -kappa^2 / (2 Delta)`` -- the textbook planar-DRAG form (acceptance ④).
     Raises via :func:`check_c1` if ``a`` does not satisfy the ``c1`` endpoint condition.
     """
     check_c1(a, T, tol=c1_tol)
