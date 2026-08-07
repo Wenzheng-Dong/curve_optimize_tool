@@ -227,7 +227,10 @@ def small_budget_solution():
 @pytest.mark.slow
 def test_gate_and_c1_constraint_jacobian_is_full_rank_at_the_solution(small_budget_solution):
     problem, res = small_budget_solution
-    x = np.concatenate([res.coeffs_a, res.coeffs_c, [res.Phi_0, res.phi_vz, res.s]])
+    # F05b: the solver vector grew a second epigraph slack (r, the R guard's
+    # max|tau| bound) -- the gate/c1 block does not depend on it, but the
+    # vector still has to be the right length for jax.jacrev to trace.
+    x = np.concatenate([res.coeffs_a, res.coeffs_c, [res.Phi_0, res.phi_vz, res.s, res.r]])
 
     J_gate = optimize._budget_gate_constraint(problem).jac(x)
     J_c1 = optimize._budget_c1_constraint(problem).A
