@@ -101,10 +101,13 @@ def test_idle_decoherence_increment_matches_qutip_builtin_average_gate_fidelity(
     fid = qt.average_gate_fidelity(U_super, target=qt.qeye(2))
     infid_builtin = 1.0 - fid
 
-    expected = DEV.decoherence_floor / 3.0
+    # DEV.decoherence_floor is already (Gamma1+Gamma_phi)*T/3 -- the average
+    # gate infidelity, not the raw population-decay probability.
+    expected = DEV.decoherence_floor
     assert infid_builtin == pytest.approx(expected, rel=5e-3)
-    # and it is *not* the plan's literal (Gamma1+Gamma_phi)*T constant:
-    assert infid_builtin < DEV.decoherence_floor / 2.0
+    # and it is *not* the population-decay probability (Gamma1+Gamma_phi)*T
+    # itself, i.e. 3x the average-infidelity floor:
+    assert infid_builtin < 3.0 * DEV.decoherence_floor / 2.0
 
 
 def test_csv_export_round_trip(tmp_path):
