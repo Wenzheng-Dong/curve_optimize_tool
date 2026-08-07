@@ -29,3 +29,6 @@ dist/
 # 环境
 .venv/
 venv/
+
+# agent worktrees (transient, not part of the repo)
+.claude/worktrees/
