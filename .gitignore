@@ -32,3 +32,6 @@ venv/
 
 # agent worktrees (transient, not part of the repo)
 .claude/worktrees/
+
+# stray scratch dir, not part of this repo
+proposals/
