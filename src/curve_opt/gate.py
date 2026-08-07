@@ -249,34 +249,110 @@ DRIVE_X3 = 0.5 * (_LOWER3 + jnp.conj(_LOWER3).T)
 DRIVE_Y3 = 0.5j * (jnp.conj(_LOWER3).T - _LOWER3)
 
 
-def three_level_bare(delta) -> jnp.ndarray:
-    """``diag(0, 0, delta)`` -- the undriven three-level Hamiltonian.
+#: ``(delta_z / 2) * diag(1, -1, -3)`` is the F05 Z-noise embedding -- see
+#: :func:`three_level_bare`'s docstring for the derivation. Equal to
+#: ``(1/2)(I - 2 NUMBER)`` with ``NUMBER = diag(0, 1, 2)``: reduces to
+#: ``sigma_z = |0><0| - |1><1|`` (``propagate.py``'s ``PAULI`` convention,
+#: tex Eq. (pauli)) exactly on the qubit block, and extends *proportionally*
+#: to ``|2>`` rather than padding with zero.
+_Z3_LADDER = jnp.diag(jnp.array([1.0, -1.0, -3.0], dtype=jnp.complex128))
+
+
+def three_level_bare(delta, delta_z=0.0) -> jnp.ndarray:
+    """``diag(0, 0, delta) + (delta_z / 2) diag(1, -1, -3)`` -- the undriven 3-level Hamiltonian.
 
     ``delta`` is the anharmonicity (``curve_opt.device.Device.delta``), not
     the static-detuning noise moment -- see the section docstring above.
+
+    F05 addition -- quasi-static Z-noise
+    --------------------------------------
+    ``delta_z`` defaults to ``0.0`` (backward compatible: every pre-F05
+    caller, including F04's ``gate_level="three_level"`` hard constraint,
+    gets exactly the old noise-free Hamiltonian).
+
+    **The qubit-block 1/2 factor.** On the computational subspace this
+    injects ``H_z`` from
+    ``_self_study/_write-up/geometric_robust_leakage_gates.tex`` Eq. (errors),
+    ``H_z = (delta_z / 2) sigma_z`` -- **not** ``delta_z sigma_z`` as
+    ``_plan_full_cost.md`` section 2.1's convention-summary line literally
+    states (a documentation bug already present in ``_plan.md`` section 2.1,
+    i.e. predating the full-cost era -- flagged for leader disposition in the
+    F05 dev log, not silently fixed in the plan text). Every C1/C2 weight in
+    :mod:`curve_opt.budget` (``w1 = (1/6)<delta_z^2>``, etc.) is fit to the
+    tex's actual Magnus-expansion result, which needs the 1/2 factor: tex's
+    Eq. (Tdef)/(magnus) chain gives ``1 - Fbar|_delta_z = delta_z^2/6
+    |r(L)-r(0)|^2`` only when ``H_z = delta_z sigma_z / 2``; the plan's
+    un-halved line would quadruple the predicted infidelity relative to what
+    ``w1`` was derived from. This is the first place in the codebase that
+    ever builds a noisy propagator from this convention -- C1/C2 were always
+    evaluated as closed-form curve invariants times the weight, never
+    simulated -- so the discrepancy was latent until F05 needed to inject
+    ``delta_z`` into an actual Hamiltonian; ``tests/test_f05_budget_validation.py``'s
+    perturbative cross-check verifies the 1/2 factor numerically against the
+    tex formula (small ``delta_z``, huge ``|delta|`` to suppress leakage),
+    independent of this derivation.
+
+    **The level-|2> extension is not a free/inconsequential choice.** An
+    earlier version of this function zero-padded ``delta_z`` on ``|2>``
+    (``diag(1, -1, 0)``), reasoning that tex's ``H_z`` is defined purely on
+    the qubit subspace with no reference to a third level. That is
+    numerically **wrong**, not merely an unvalidated guess: cross-checking
+    against ``curve_opt.novera.three_level_gate`` at this device's actual
+    ``eta = 0.25`` (``tests/test_f05_budget_validation.py``, a random 3D
+    waveform) found a *phase-aligned* disagreement growing linearly with
+    ``delta_z``, reaching ~0.03 (matrix-element scale) at
+    ``delta_z = device.static_detuning_rate`` -- far above the ~7e-7
+    zero-noise baseline -- even though the leakage population for that same
+    waveform is only ~8e-6. The final leaked population is small, but the
+    *transient* population that leaks out and coherently returns during the
+    pulse is not, so a mismatched phase acquired on ``|2>`` during that
+    excursion does not average away. Physically, this also has the more
+    defensible reading: a quasi-static ``delta_z`` is a common-mode
+    qubit-frequency offset (flux/charge noise shifting the whole ladder, not
+    a per-transition recalibration), so in the rotating frame it detunes the
+    ``n``-th level by ``-n delta_z`` to leading order -- exactly
+    ``curve_opt.novera``/``db_transmon``'s own ``DETUNING = -NUMBER``
+    convention (``NUMBER = diag(0, 1, 2)``). ``_Z3_LADDER`` is that same
+    proportional structure, shifted by a constant (unobservable) multiple of
+    the identity so that it reduces to *exactly* tex's ``sigma_z`` on the
+    qubit block (matching the 1/2-factor derivation above) while extending
+    proportionally, not by zero, to ``|2>``. Cross-checked against
+    ``curve_opt.novera.three_level_gate`` (matched *up to a global phase* --
+    a diagonal common shift is a pure gauge freedom, not a fittable
+    parameter) at ``delta_z in {0, 0.01, 0.1, 0.5, 1, 2} * static_detuning_rate``:
+    the phase-aligned disagreement stays flat at the ~7e-7 discretization
+    baseline across that whole range (``tests/test_f05_budget_validation.py``),
+    confirming the proportional extension, not the zero-padded one.
     """
-    return jnp.diag(jnp.stack([0.0 * delta, 0.0 * delta, delta]).astype(jnp.complex128))
+    delta = jnp.asarray(delta)
+    bare = jnp.diag(jnp.stack([0.0 * delta, 0.0 * delta, delta]).astype(jnp.complex128))
+    z_term = jnp.asarray(0.5 * delta_z, dtype=jnp.complex128) * _Z3_LADDER
+    return bare + z_term
 
 
-def _three_level_cell_propagators(om_x, om_y, delta, dt: float) -> jnp.ndarray:
+def _three_level_cell_propagators(om_x, om_y, delta, dt: float, delta_z=0.0) -> jnp.ndarray:
     """``exp(-i dt H(Omega_x_k, Omega_y_k))`` per cell, shape ``(N, 3, 3)``.
 
     ``jax.scipy.linalg.expm`` in place of :mod:`curve_opt.propagate`'s closed
     ``sinc`` form (section docstring): no ``|Omega| = 0`` guard is needed here
     because ``expm`` has no coordinate singularity at zero drive (unlike the
-    ``1 / |Omega|`` division the two-level closed form removes).
+    ``1 / |Omega|`` division the two-level closed form removes). ``delta_z``
+    (F05 addition, default ``0.0``) is constant over the whole cell, matching
+    the quasi-static noise model (module docstring, ``_plan_full_cost.md``
+    section 2.1) -- one Hamiltonian term added before exponentiating, not a
+    per-cell resampled quantity.
     """
     om_x = jnp.asarray(om_x, dtype=jnp.float64)
     om_y = jnp.asarray(om_y, dtype=jnp.float64)
     H = (
-        three_level_bare(delta)[None, :, :]
+        three_level_bare(delta, delta_z)[None, :, :]
         + om_x[:, None, None] * DRIVE_X3[None, :, :]
         + om_y[:, None, None] * DRIVE_Y3[None, :, :]
     )
     return jax.vmap(lambda h: jax.scipy.linalg.expm(-1j * h * dt))(H)
 
 
-def three_level_propagator(om_x_mid, om_y_mid, T: float, delta) -> jnp.ndarray:
+def three_level_propagator(om_x_mid, om_y_mid, T: float, delta, delta_z=0.0) -> jnp.ndarray:
     """``U_3(T)``, shape ``(3, 3)``, from midpoint samples of the broadcast waveform.
 
     Same "newest on the left" contract as :func:`curve_opt.propagate.chain`
@@ -285,12 +361,20 @@ def three_level_propagator(om_x_mid, om_y_mid, T: float, delta) -> jnp.ndarray:
     left. Only the final propagator is returned -- G only ever needs
     ``U_3(T)``, not the intermediate trajectory the two-level chain keeps for
     the space curve.
+
+    ``delta_z`` (F05 addition, default ``0.0``, backward compatible) injects
+    quasi-static Z-noise into the qubit subspace -- see
+    :func:`three_level_bare`. Multiplicative amplitude error (epsilon) is not
+    a parameter here: the caller scales ``om_x_mid``/``om_y_mid`` by
+    ``(1 + epsilon)`` before calling, exactly matching tex's ``H_eps =
+    epsilon * Omega/2 * n . sigma`` (proportional to the *drive*, applied to
+    the whole broadcast waveform, not a separate Hamiltonian term).
     """
     om_x = jnp.asarray(om_x_mid, dtype=jnp.float64)
     om_y = jnp.asarray(om_y_mid, dtype=jnp.float64)
     N = om_x.shape[0]
     dt = T / N
-    steps = _three_level_cell_propagators(om_x, om_y, delta, dt)
+    steps = _three_level_cell_propagators(om_x, om_y, delta, dt, delta_z)
     # ★ newest on the left, same contract as propagate.chain's U_edge scan.
     U_edge = jax.lax.associative_scan(lambda A, B: jnp.einsum("kij,kjl->kil", B, A), steps)
     return U_edge[-1]
