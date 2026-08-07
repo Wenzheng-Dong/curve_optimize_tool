@@ -92,7 +92,7 @@ import numpy as np
 from scipy.optimize import BFGS, Bounds, LinearConstraint, NonlinearConstraint, minimize
 from scipy.sparse import csr_matrix
 
-from curve_opt import basis, budget, gate, geometry, metrics, novera, propagate
+from curve_opt import basis, budget, gate, geometry, metrics, novera, parametrization, propagate
 from curve_opt.device import DEFAULT_DEVICE, Device
 
 __all__ = [
@@ -838,9 +838,10 @@ GATE_LEVELS = ("three_level", "two_level")
 class BudgetProblem(NamedTuple):
     """One F04 error-budget optimization problem. Pure data, no solver state.
 
-    Free parameters ``x = [a (M), c (M), Phi_0 (1), Phi_vz (1), s (1)]``,
-    ``n_coeffs = 2M + 2`` physical parameters plus the epigraph slack ``s``
-    (task brief §2.3: 2M + 2 = 42 at M = 20).
+    Free parameters ``x = [a (M), c (M), Phi_0 (1), Phi_vz (1), s (1), r (1)]``,
+    ``n_coeffs = 2M + 2`` physical parameters plus two epigraph slacks: ``s``
+    (the peak, task brief §2.3: 2M + 2 = 42 at M = 20) and ``r``, the F05b R
+    guard's ``max|tau|`` bound (``_plan_full_cost.md`` §5.4).
     """
 
     M: int
@@ -870,7 +871,24 @@ class BudgetProblem(NamedTuple):
     of :mod:`curve_opt.budget`: two chains, not three)."""
     n_peak: int = 400
     """Coarser grid the peak epigraph inequality is sampled on -- same
-    economy-grid rationale as :class:`Problem`'s field of the same name."""
+    economy-grid rationale as :class:`Problem`'s field of the same name. The
+    R guard (F05b) reuses this same grid for ``tau``: ``tau`` is band-limited
+    by the same ``M`` harmonics ``kappa`` is, so the economy-grid argument
+    that justifies sampling ``|Omega|`` on ``n_peak`` points applies to
+    ``|tau|`` unchanged -- no separate grid parameter is introduced."""
+    rho: float = 0.5
+    """F05b R guard: hard cap ``max|tau| <= rho * |Delta| / 2``
+    (``_plan_full_cost.md`` §5.4). Default 0.5, so the cap is ``0.25 |Delta|``
+    -- the *same* fractional scale as this device's own drive perturbation
+    parameter ``eta = Omega_max / |Delta| = 0.25`` (:attr:`Device.eta`), which
+    is the perturbation parameter the readout map's own DRAG expansion is
+    already trusted at. Ties the two small parameters the readout map
+    (``curve_opt.parametrization.drag_stark_quadratures``) depends on --
+    drive amplitude (``eta``) and torsion (``tau/Delta``) -- to one order of
+    smallness, rather than picking an unrelated number. ★ Chosen from this
+    perturbative-validity argument alone, before any guarded ``rcp+3D``
+    construction run existed to check against (task brief F05b §5: "不许调
+    rho 去让 ②通过")."""
     hessian_mode: str = "gauss_newton"
     maxiter: int = 3000
     fixed_budget_survey: bool = False
@@ -886,8 +904,13 @@ class BudgetProblem(NamedTuple):
 
     @property
     def n_vars(self) -> int:
-        """Solver-vector length: :attr:`n_coeffs` plus the epigraph slack ``s``."""
-        return self.n_coeffs + 1
+        """Solver-vector length: :attr:`n_coeffs` plus the two epigraph slacks ``s``, ``r``."""
+        return self.n_coeffs + 2
+
+    @property
+    def tau_guard_bound(self) -> float:
+        """``rho * |Delta| / 2`` -- the R guard's hard cap on ``max|tau|``."""
+        return float(self.rho) * abs(self.device.delta) / 2.0
 
 
 class BudgetSolveResult(NamedTuple):
@@ -898,6 +921,11 @@ class BudgetSolveResult(NamedTuple):
     Phi_0: float
     phi_vz: float
     s: float
+    r: float
+    """The R guard epigraph slack (raw solver value) -- mirrors ``s``. Not
+    necessarily tight (nothing in the objective drives it down, same as
+    ``s``), so :attr:`tau_peak` is the value to report/check, not this one
+    (mirrors :attr:`peak_phys` vs ``s``)."""
     stop_reason: str
     status: int
     nit: int
@@ -906,6 +934,12 @@ class BudgetSolveResult(NamedTuple):
     gate_residual: np.ndarray
     c1_residual: np.ndarray
     peak_phys: float
+    tau_peak: float
+    """``max|tau|`` measured directly from ``coeffs_c`` on the ``n_peak``
+    grid (the grid the R guard constraint was built on -- same rationale as
+    :attr:`peak_phys`'s docstring at the call site: reporting on a finer grid
+    than the constraint used can show an apparent, grid-resolution-only,
+    overshoot)."""
     polar_margin: float | None
     scipy_message: str
     fixed_budget_survey: bool = False
@@ -916,23 +950,26 @@ class BudgetSolveResult(NamedTuple):
 
 
 def _split_budget(problem: BudgetProblem, x):
-    """Solver vector -> ``(a, c, Phi_0, phi_vz, s)``."""
+    """Solver vector -> ``(a, c, Phi_0, phi_vz, s, r)``."""
     M = problem.M
     a = x[:M]
     c = x[M : 2 * M]
     Phi_0 = x[2 * M]
     phi_vz = x[2 * M + 1]
     s = x[2 * M + 2]
-    return a, c, Phi_0, phi_vz, s
+    r = x[2 * M + 3]
+    return a, c, Phi_0, phi_vz, s, r
 
 
 def _budget_x0(problem: BudgetProblem) -> np.ndarray:
-    """Initial solver vector: the given starting coefficients plus a measured ``s0``.
+    """Initial solver vector: the given starting coefficients plus measured ``s0``, ``r0``.
 
     ``s0`` is the actual peak of the initial broadcast waveform on the peak
-    grid, clipped into ``[0, Omega_max]`` -- trust-constr does not require an
-    inequality-feasible start, but starting ``s`` at a value the ``Bounds``
-    object already rejects would be a needless own goal.
+    grid, clipped into ``[0, Omega_max]``; ``r0`` (F05b) is the actual
+    ``max|tau|`` of the initial ``c`` on the same grid, clipped into
+    ``[0, tau_guard_bound]`` -- trust-constr does not require an
+    inequality-feasible start, but starting a slack at a value the
+    ``Bounds`` object already rejects would be a needless own goal.
     """
     a0 = np.asarray(problem.coeffs0_a, dtype=float)
     c0 = np.asarray(problem.coeffs0_c, dtype=float)
@@ -941,20 +978,27 @@ def _budget_x0(problem: BudgetProblem) -> np.ndarray:
     )
     s0 = float(np.max(np.hypot(np.asarray(om_x0), np.asarray(om_y0))))
     s0 = float(np.clip(s0, 0.0, problem.device.rabi_max_rate))
-    return np.concatenate([a0, c0, [problem.Phi_0_0, problem.phi_vz_0, s0]])
+    tau0 = np.asarray(parametrization.tau_of_coeffs(c0, problem.T, problem.n_peak))
+    r0 = float(np.max(np.abs(tau0))) if tau0.size else 0.0
+    r0 = float(np.clip(r0, 0.0, problem.tau_guard_bound))
+    return np.concatenate([a0, c0, [problem.Phi_0_0, problem.phi_vz_0, s0, r0]])
 
 
 def _budget_bounds(problem: BudgetProblem) -> Bounds:
-    """``s`` is bounded in ``[0, Omega_max]`` (the hardware ceiling); everything
-    else is free -- the epigraph mechanism this reuses (module docstring of
-    :class:`Problem`), specialized to a *fixed* physical ceiling rather than
-    an objective-weighted tradeoff (task brief §2.3: peak is a hard
-    inequality here, not a lambda-weighted objective term)."""
+    """``s`` bounded in ``[0, Omega_max]`` (the hardware ceiling), ``r`` bounded
+    in ``[0, tau_guard_bound]`` (F05b's R guard, ``_plan_full_cost.md`` §5.4);
+    everything else is free -- the epigraph mechanism this reuses (module
+    docstring of :class:`Problem`), specialized to *fixed* physical ceilings
+    rather than an objective-weighted tradeoff (task brief §2.3: peak, and
+    now the R guard, are hard inequalities here, not lambda-weighted
+    objective terms)."""
     n = problem.n_vars
     lb = np.full(n, -np.inf)
     ub = np.full(n, np.inf)
+    lb[-2] = 0.0
+    ub[-2] = problem.device.rabi_max_rate
     lb[-1] = 0.0
-    ub[-1] = problem.device.rabi_max_rate
+    ub[-1] = problem.tau_guard_bound
     return Bounds(lb, ub)
 
 
@@ -977,7 +1021,7 @@ def _budget_objective(problem: BudgetProblem):
     T, N, device = problem.T, problem.N_grid, problem.device
 
     def residual(x):
-        a, c, Phi_0, _phi_vz, _s = _split_budget(problem, x)
+        a, c, Phi_0, _phi_vz, _s, _r = _split_budget(problem, x)
         return budget.residual_vector(a, c, Phi_0, T, device, N)
 
     R = jax.jit(residual)
@@ -1021,7 +1065,7 @@ def _budget_gate_constraint(problem: BudgetProblem):
         raise ValueError(f"gate_level must be one of {GATE_LEVELS}, got {level!r}")
 
     def residual(x):
-        a, c, Phi_0, phi_vz, _s = _split_budget(problem, x)
+        a, c, Phi_0, phi_vz, _s, _r = _split_budget(problem, x)
         om_x, om_y = budget.broadcast_waveform(a, c, Phi_0, T, device.delta, N)
         if level == "three_level":
             U3 = gate.three_level_propagator(om_x, om_y, T, device.delta)
@@ -1084,7 +1128,7 @@ def _budget_peak_constraint(problem: BudgetProblem):
     n = problem.n_vars
 
     def cone(x):
-        a, c, Phi_0, _phi_vz, s = _split_budget(problem, x)
+        a, c, Phi_0, _phi_vz, s, _r = _split_budget(problem, x)
         om_x, om_y = budget.broadcast_waveform(a, c, Phi_0, T, device.delta, n_peak)
         return om_x ** 2 + om_y ** 2 - s ** 2
 
@@ -1107,6 +1151,67 @@ def _budget_peak_constraint(problem: BudgetProblem):
         jac=lambda x: np.asarray(jac(jnp.asarray(x))),
         hess=hess,
     )
+
+
+def _tau_design_matrix(M: int, T: float, N: int) -> np.ndarray:
+    """The ``(N, M)`` constant matrix ``S_tau`` with ``S_tau @ c == tau_of_coeffs(c, T, N)``.
+
+    ``tau_of_coeffs`` (:mod:`curve_opt.parametrization`) is *exactly* linear
+    in ``c`` (its own docstring: "a second Fourier series"), so its Jacobian
+    at any point -- taken here at ``c = 0`` via ``jax.jacrev``, once per
+    constraint build, not per solver iteration -- *is* the whole map, read
+    off automatically rather than re-derived by hand. That matters because
+    the sign of the readout map this feeds (``drag_stark_quadratures``) was
+    itself the subject of a real bug (F05-redo): building the R guard's
+    matrix from :func:`curve_opt.parametrization.tau_of_coeffs` directly
+    means it can never drift out of sync with that module's own convention.
+    """
+    zero = jnp.zeros(M)
+    jac = jax.jacrev(lambda c: parametrization.tau_of_coeffs(c, T, N))
+    return np.asarray(jac(zero))
+
+
+def _budget_tau_guard_constraint(problem: BudgetProblem) -> LinearConstraint:
+    """F05b R guard: ``max_s |tau(s)| <= rho * |Delta| / 2`` (``_plan_full_cost.md`` §5.4).
+
+    Epigraph, mirroring :func:`_epigraph_constraints`'s planar peak block
+    (task brief F05b: "走 epigraph（辅助变量 + 线性不等式），照 optimize.py
+    里 peak epigraph 的现成模式"): the auxiliary slack ``r`` (last entry of
+    the solver vector, bounded to ``[0, tau_guard_bound]`` by
+    :func:`_budget_bounds`) is linked to ``tau`` by two blocks of *linear*
+    inequalities on the same economy ``n_peak`` grid the ``Omega`` epigraph
+    already samples (``tau`` is band-limited by the same ``M`` harmonics
+    ``kappa`` is -- :class:`BudgetProblem.n_peak`'s docstring):
+
+        S_tau @ c - r <= 0
+        -S_tau @ c - r <= 0
+
+    i.e. ``|tau(t_k)| <= r`` at every sampled ``t_k``. ``tau`` depends only
+    on ``c`` (:mod:`curve_opt.parametrization`'s module docstring: ``a``
+    carries ``kappa``, ``c`` carries ``Phi``/``tau``), so this is a genuine
+    ``LinearConstraint`` -- no ``NonlinearConstraint``/Jacobian machinery is
+    needed at all, and the objective stays exactly as smooth as before
+    (AGENTS.md numerical discipline 7).
+
+    This diagnoses a real, already-observed failure mode (task brief
+    F05b §2): without it, ``solve_budget``'s ``general`` layer is free to
+    push ``tau`` toward ``-Delta`` (the readout map's own pole,
+    ``kappa_y = -kappa_dot / (Delta + tau)``), which the F05-redo `rcp+3D`
+    construction run in fact did (``max|tau| = 1.931x |Delta|/2``,
+    ``min|Delta+tau| = 5.77%`` of ``|Delta|``) -- not because any of the
+    three existing hard constraints (G, P, peak) were violated, but because
+    none of them ever bounded ``tau`` at all.
+    """
+    M, T, n_peak = problem.M, problem.T, problem.n_peak
+    n = problem.n_vars
+    S_tau = _tau_design_matrix(M, T, n_peak)
+    A_pos = np.zeros((n_peak, n))
+    A_pos[:, M : 2 * M] = S_tau
+    A_pos[:, -1] = -1.0
+    A_neg = np.zeros((n_peak, n))
+    A_neg[:, M : 2 * M] = -S_tau
+    A_neg[:, -1] = -1.0
+    return LinearConstraint(np.vstack([A_pos, A_neg]), -np.inf, 0.0)
 
 
 def budget_manifest_for(problem: BudgetProblem, *, early_stop: EarlyStop | None = None, **extra) -> dict:
@@ -1142,6 +1247,10 @@ def budget_manifest_for(problem: BudgetProblem, *, early_stop: EarlyStop | None 
         "winding_branch": float(problem.theta),
         "device": problem.device.to_manifest(),
         "novera_git_hash": novera.UPSTREAM_GIT_HASH,
+        "tau_guard": {
+            "rho": float(problem.rho),
+            "bound": problem.tau_guard_bound,
+        },
         "objective": {
             "terms": ["c1", "c2", "c3", "c4"],
             "weights": dict(budget.weights_from_device(problem.device)._asdict()),
@@ -1210,7 +1319,7 @@ def solve_budget(
     fine_grids=FINE_GRIDS,
     verbose: int = 0,
 ) -> BudgetSolveResult:
-    """Run one F04 budget-mode optimization: min C1+C2+C3+C4 s.t. G, P, peak.
+    """Run one F04 budget-mode optimization: min C1+C2+C3+C4 s.t. G, P, peak, R guard.
 
     Mirrors :func:`solve`'s shape (assemble scipy objects, call trust-constr,
     checkpoint through *recorder* if given -- see the module-level "F04"
@@ -1218,6 +1327,11 @@ def solve_budget(
     the caller supplies one with a compatible ``append``/``close``) but is
     otherwise a fresh implementation: the free-parameter set, constraint set
     and objective are all different from :func:`solve`'s (section docstring).
+
+    F05b adds :func:`_budget_tau_guard_constraint` (the R guard,
+    ``_plan_full_cost.md`` §5.4) to the constraint set unconditionally --
+    every ``general``-layer solve now carries it, not only ones that opt in,
+    per the task brief's "F06 开工前必须给 BudgetProblem 加硬不等式".
     """
     if problem.hessian_mode not in HESSIAN_MODES:
         raise ValueError(f"hessian_mode must be one of {HESSIAN_MODES}")
@@ -1231,6 +1345,7 @@ def solve_budget(
         _budget_gate_constraint(problem),
         _budget_c1_constraint(problem),
         _budget_peak_constraint(problem),
+        _budget_tau_guard_constraint(problem),
     ]
 
     objective_kwargs = (
@@ -1242,7 +1357,7 @@ def solve_budget(
     U_target = propagate.target_x(problem.theta)
 
     def evaluate(x):
-        a, c, Phi_0, phi_vz, s = _split_budget(problem, x)
+        a, c, Phi_0, phi_vz, s, _r = _split_budget(problem, x)
         terms = budget.budget_terms(a, c, Phi_0, problem.T, problem.device, problem.N_grid)
         om_x, om_y = budget.broadcast_waveform(
             a, c, Phi_0, problem.T, problem.device.delta, problem.N_grid
@@ -1272,7 +1387,7 @@ def solve_budget(
         total = float(terms.total)
 
         if recorder is not None and (state["n"] - 1) % problem.checkpoint_every == 0:
-            a, c, Phi_0, phi_vz, s = _split_budget(problem, xk)
+            a, c, Phi_0, phi_vz, s, _r = _split_budget(problem, xk)
             recorder.append_budget(
                 state["n"] - 1,
                 np.asarray(a),
@@ -1328,7 +1443,7 @@ def solve_budget(
     else:
         stop_reason = "failed"
 
-    a, c, Phi_0, phi_vz, s = _split_budget(problem, res.x)
+    a, c, Phi_0, phi_vz, s, r = _split_budget(problem, res.x)
     terms, gate_res, c1_res, margin = evaluate(res.x)
     # ★ same grid the peak epigraph constraint was built on (n_peak, not
     # N_grid): metrics.peak's docstring documents why this must match --
@@ -1339,6 +1454,11 @@ def solve_budget(
         a, c, Phi_0, problem.T, problem.device.delta, problem.n_peak
     )
     peak_phys = float(np.max(np.hypot(np.asarray(om_x_peak), np.asarray(om_y_peak))))
+    # ★ F05b: same grid rationale as peak_phys above, applied to tau -- the
+    # raw slack r is not necessarily tight (docstring of BudgetSolveResult.r),
+    # so tau_peak is measured directly from the solved c, independently of r.
+    tau_final = np.asarray(parametrization.tau_of_coeffs(c, problem.T, problem.n_peak))
+    tau_peak = float(np.max(np.abs(tau_final))) if tau_final.size else 0.0
 
     out = BudgetSolveResult(
         coeffs_a=np.asarray(a),
@@ -1346,6 +1466,7 @@ def solve_budget(
         Phi_0=float(Phi_0),
         phi_vz=float(phi_vz),
         s=float(s),
+        r=float(r),
         stop_reason=stop_reason,
         status=int(res.status),
         nit=int(res.nit),
@@ -1354,6 +1475,7 @@ def solve_budget(
         gate_residual=gate_res,
         c1_residual=c1_res,
         peak_phys=peak_phys,
+        tau_peak=tau_peak,
         polar_margin=margin,
         scipy_message=str(res.message),
         fixed_budget_survey=bool(problem.fixed_budget_survey),
@@ -1369,6 +1491,7 @@ def solve_budget(
             gate_residual=out.gate_residual.tolist(),
             c1_residual=out.c1_residual.tolist(),
             peak_phys=out.peak_phys,
+            tau_peak=out.tau_peak,
             polar_margin=out.polar_margin,
             terms=out.terms._asdict(),
             void_for_claims=out.void_for_claims,
