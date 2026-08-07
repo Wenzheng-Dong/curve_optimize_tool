@@ -58,12 +58,17 @@ def test_fenchel_min_time():
 
 
 def test_decoherence_floor():
-    """(Gamma1 + Gamma_phi) * T = 1.25e-3 -- _plan_full_cost.md §0, §2.5, §3.2."""
+    """(Gamma1 + Gamma_phi) * T / 3 = 4.1667e-4 -- _plan_full_cost.md §0, §2.5, §3.2.
+
+    The 1/3 converts the population-decay probability (Gamma1+Gamma_phi)*T
+    into the average gate infidelity via Nielsen's d(d+1)/2 factor for a
+    qubit (d=2).
+    """
     d = DEFAULT_DEVICE
     assert d.gamma1 == pytest.approx(1.0 / 60_000.0)
     assert d.gamma_phi == pytest.approx(1.0 / 60_000.0 - 0.5 / 60_000.0)
     assert d.gamma1 + d.gamma_phi == pytest.approx(2.5e-5, rel=1e-12)
-    assert d.decoherence_floor == pytest.approx(1.25e-3, rel=1e-12)
+    assert d.decoherence_floor == pytest.approx(4.1667e-4, rel=1e-4)
 
 
 def test_resonant_harmonic_equals_n_modes():

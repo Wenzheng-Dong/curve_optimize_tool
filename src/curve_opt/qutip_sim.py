@@ -66,21 +66,22 @@ coherent unitary block ``B`` (matrix identity, checked directly in
 ``tests/test_f07_qutip_sim.py``), so :func:`channel_infidelity` at zero
 dissipation must agree with :func:`coherent_infidelity` to solver tolerance.
 
-★ Verified discrepancy, flagged for leader disposition (not fixed here,
-out of F07's scope): the commonly-quoted "decoherence floor"
-``(Gamma1 + Gamma_phi) * T`` (``curve_opt.device.Device.decoherence_floor``,
-``_plan_full_cost.md`` sec 0/2.5) is **not** what a rigorous average-gate-
+★ Verified and fixed: the raw population-decay probability
+``(Gamma1 + Gamma_phi) * T`` is **not** what a rigorous average-gate-
 fidelity calculation gives for an idle qubit under these two collapse
-operators. Three independent routes -- a hand-derived Kraus-operator
+operators. Five independent routes -- a hand-derived Kraus-operator
 expansion of amplitude damping to ``O(p)``, this module's own
-:func:`channel_infidelity` tomography, and ``qutip.average_gate_fidelity``
+:func:`channel_infidelity` tomography, ``qutip.average_gate_fidelity``
 called directly on ``qutip.propagator``'s output superoperator for a bare
-two-level idle channel -- all agree the correct leading-order result is
-``(Gamma1 + Gamma_phi) * T / 3``, a factor of 3 below the plan's constant
-(measured ``4.165e-4`` vs. the plan's ``1.25e-3``, at this device's T1 = T2echo
-= 60 us, T = 50 ns). See ``_dev_logs/F07_end_to_end.md`` sec "Lindblad
-discrepancy" for the full derivation and numbers this module's own dev-log
-script measured on both table inputs.
+two-level idle channel, an independent QuTiP idle-channel re-check, and pure
+amplitude damping ``Gamma1 * T / 3`` -- all agree the correct leading-order
+result is ``(Gamma1 + Gamma_phi) * T / 3``, a factor of 3 below the raw
+population-decay probability (``4.1667e-4`` vs. ``1.25e-3`` at this device's
+T1 = T2echo = 60 us, T = 50 ns).
+``curve_opt.device.Device.decoherence_floor`` now returns the corrected
+``/3`` value directly. See ``_dev_logs/F07_end_to_end.md`` sec "Lindblad
+discrepancy" and ``_dev_logs/fix_decoherence_floor.md`` for the full
+derivation and numbers.
 """
 
 from __future__ import annotations
