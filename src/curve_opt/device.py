@@ -23,11 +23,36 @@ is already in the natural units of the Hamiltonian (rad/ns times ns = rad).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, fields
+import warnings
+from dataclasses import dataclass, field, fields
 
-__all__ = ["Device", "DEFAULT_DEVICE", "TWO_PI"]
+__all__ = ["Device", "DEFAULT_DEVICE", "TWO_PI", "GROUPS"]
 
 TWO_PI = 2.0 * math.pi
+
+#: The three semantic groups a stored :class:`Device` field can belong to, in the
+#: order a configuration file should present them (F08a).
+#:
+#: ``hardware``
+#:     Properties of the chip. Change these when you change device.
+#: ``noise``
+#:     The *noise hypothesis* the error budget is conditioned on. These are not
+#:     device properties -- they set the budget weights ``w_i``
+#:     (``_plan_full_cost.md`` §2.4a), so changing them changes the noise model,
+#:     which is a different question from changing the chip.
+#: ``design``
+#:     Choices of this project, not of the device -- see the module docstring.
+#:     ⚠️ ``gate_time`` and ``n_modes`` are **coupled**: ``T = 50`` ns was picked so
+#:     the leakage-resonant harmonic ``n* = 2 T |alpha|`` lands exactly on the
+#:     highest harmonic the basis carries (``n* == n_modes == 20``). Moving one
+#:     without the other silently switches the C4 spectral-zero design off; see
+#:     :attr:`Device.resonant_harmonic_matched`.
+GROUPS = ("hardware", "noise", "design")
+
+
+def _f(default, group: str):
+    """A dataclass field tagged with the configuration group it belongs to."""
+    return field(default=default, metadata={"group": group})
 
 
 @dataclass(frozen=True)
@@ -65,15 +90,19 @@ class Device:
         Sine-series truncation order ``M`` (§2.6, §4.3).
     """
 
-    anharmonicity: float = -0.200
-    rabi_max: float = 0.050
-    t1: float = 60_000.0
-    t2_echo: float = 60_000.0
-    static_detuning: float = 1.0e-4
-    control_error: float = 0.02
-    sample_rate: float = 2.4
-    gate_time: float = 50.0
-    n_modes: int = 20
+    # ⚠️ Declaration order is load-bearing (it is the positional-argument order of
+    # the generated ``__init__``) and is deliberately left exactly as it was before
+    # F08a added the group tags. Group membership is metadata, not order --
+    # :meth:`groups` does the regrouping for display/配置 purposes.
+    anharmonicity: float = _f(-0.200, "hardware")
+    rabi_max: float = _f(0.050, "hardware")
+    t1: float = _f(60_000.0, "hardware")
+    t2_echo: float = _f(60_000.0, "hardware")
+    static_detuning: float = _f(1.0e-4, "noise")
+    control_error: float = _f(0.02, "noise")
+    sample_rate: float = _f(2.4, "hardware")
+    gate_time: float = _f(50.0, "design")
+    n_modes: int = _f(20, "design")
 
     # -- angular rates: *_rate = 2 pi * the stored frequency ----------------
 
@@ -186,7 +215,99 @@ class Device:
         """
         return 2.0 * self.gate_time * abs(self.anharmonicity)
 
+    @property
+    def resonant_harmonic_matched(self) -> bool:
+        """Is ``n*`` still equal to :attr:`n_modes`? (F08b)
+
+        The default device satisfies this exactly (``20.0 == 20``). It is reported
+        rather than enforced: legitimate experiments move off it -- F06's noise
+        sensitivity sweep varies :attr:`control_error` (which does not affect this),
+        but a future ``T`` or ``M`` scan would. Constructing such a device emits a
+        warning and records ``False`` here; nothing raises. See :data:`GROUPS`.
+        """
+        return abs(self.resonant_harmonic - self.n_modes) < 1e-9
+
+    # -- construction from configuration (F08b) ---------------------------
+
+    def __post_init__(self) -> None:
+        # ⚠️ Deliberately does *not* validate ``t2_echo <= 2 t1`` here: that check
+        # lives in :attr:`gamma_phi` and fires on first use, which is the contract
+        # ``test_gamma_phi_raises_if_t2_exceeds_the_2t1_bound`` pins down (it builds
+        # the bad device outside the ``pytest.raises`` block). Config-loaded devices
+        # get the eager check in :meth:`from_dict` instead, so a bad JSON still
+        # fails at load rather than deep inside a solve.
+        if not self.resonant_harmonic_matched:
+            warnings.warn(
+                f"leakage-resonant harmonic n* = 2*T*|alpha| = "
+                f"{self.resonant_harmonic:g} != n_modes = {self.n_modes}: the C4 "
+                f"spectral zero no longer lands on a basis harmonic (device.GROUPS, "
+                f"_plan_full_cost.md 2.6). This is allowed -- it is a design choice, "
+                f"not an error -- but any C4 claim from this device needs the "
+                f"mismatch stated.",
+                stacklevel=2,
+            )
+
+    @classmethod
+    def from_dict(cls, cfg: dict) -> "Device":
+        """Build a device from a config mapping; unspecified fields keep their default.
+
+        Accepts either a flat ``{field: value}`` mapping or the grouped form
+        :meth:`groups` emits (``{"hardware": {...}, "noise": {...}, ...}``); the two
+        may be mixed. An unknown key is a ``ValueError`` rather than a silent no-op --
+        a typo'd override that quietly does nothing is the failure mode this whole
+        configuration layer exists to prevent.
+
+        ⚠️ Only *stored* fields can be overridden. Derived quantities
+        (:attr:`eta`, :attr:`decoherence_floor`, ...) follow from them and are not
+        settable; ``"derived"`` is accepted and ignored so a
+        :meth:`to_manifest` blob round-trips unchanged.
+        """
+        known = {f.name for f in fields(cls)}
+        flat: dict = {}
+        for key, value in cfg.items():
+            if key == "derived":
+                continue
+            if key in GROUPS:
+                if not isinstance(value, dict):
+                    raise ValueError(
+                        f"device config group {key!r} must be a mapping, got "
+                        f"{type(value).__name__}")
+                for sub, sub_value in value.items():
+                    if sub not in known:
+                        raise ValueError(
+                            f"unknown device field {sub!r} in group {key!r}; "
+                            f"known fields are {sorted(known)}")
+                    flat[sub] = sub_value
+            elif key in known:
+                flat[key] = value
+            else:
+                raise ValueError(
+                    f"unknown device field {key!r}; known fields are {sorted(known)} "
+                    f"and groups are {list(GROUPS)}")
+        flat = {k: (int(v) if k == "n_modes" else float(v)) for k, v in flat.items()}
+        dev = cls(**flat)
+        _ = dev.gamma_phi   # eager t2 <= 2*t1 check -- see __post_init__
+        return dev
+
+    # ⚠️ There is deliberately no ``from_json`` here. ``_plan.md`` §4.2 makes
+    # :mod:`curve_opt.recorder` the only module allowed to touch the filesystem
+    # (``tests/test_architecture.py::test_only_recorder_does_filesystem_io`` enforces
+    # it), so reading a device config file lives there as
+    # :func:`curve_opt.recorder.load_device`, which parses and then calls
+    # :meth:`from_dict`. This class stays a pure value object.
+
     # -- manifest -------------------------------------------------------
+
+    def groups(self) -> dict:
+        """Stored fields regrouped by :data:`GROUPS`, for display and JSON export.
+
+        The grouping is metadata on each field, so this view is independent of the
+        declaration order (which is fixed by ``__init__``'s positional signature).
+        """
+        out: dict = {g: {} for g in GROUPS}
+        for f in fields(self):
+            out[f.metadata["group"]][f.name] = getattr(self, f.name)
+        return out
 
     def to_manifest(self) -> dict:
         """Flat dict of every stored field plus every derived quantity above.
@@ -211,6 +332,7 @@ class Device:
                 "gamma_phi",
                 "decoherence_floor",
                 "resonant_harmonic",
+                "resonant_harmonic_matched",
             )
         }
         return {**base, "derived": derived}

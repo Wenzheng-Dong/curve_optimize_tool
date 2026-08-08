@@ -96,6 +96,7 @@ from curve_opt.device import Device
 __all__ = [
     "HISTORY_COLUMNS",
     "HISTORY_COLUMNS_BUDGET",
+    "load_device",
     "REPO_ROOT",
     "REQUIRED_MANIFEST_KEYS",
     "REQUIRED_MANIFEST_KEYS_BUDGET",
@@ -622,6 +623,26 @@ def _device_from_manifest(device_manifest: dict) -> Device:
     fed back in as a keyword ``Device`` does not accept.
     """
     return Device(**{k: v for k, v in device_manifest.items() if k != "derived"})
+
+
+def load_device(path) -> Device:
+    """Build a :class:`~curve_opt.device.Device` from a JSON config file (F08b).
+
+    The file may be flat (``{"gate_time": 40.0}``) or grouped the way
+    :meth:`Device.groups` emits (``{"hardware": {...}, "noise": {...},
+    "design": {...}}``), and needs to name only the fields it overrides -- every
+    other field keeps the documented default from ``device.py``. A
+    :meth:`Device.to_manifest` blob works too, so a device can be lifted straight
+    out of a RunRecord.
+
+    Lives here rather than on ``Device`` because ``_plan.md`` §4.2 makes this the
+    only module permitted to read the filesystem; ``Device.from_dict`` does all
+    the actual work and stays a pure function.
+
+    An unknown field is a ``ValueError``, not a silent no-op -- see
+    :meth:`Device.from_dict`.
+    """
+    return Device.from_dict(json.loads(Path(path).read_text()))
 
 
 def _verify_history_energy(record: RunRecord, *, atol: float) -> dict:
