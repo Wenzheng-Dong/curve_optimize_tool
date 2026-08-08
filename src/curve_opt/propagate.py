@@ -20,6 +20,21 @@ Therefore: **any new propagator code must pass a non-commuting case plus an
 independent second implementation (numpy / qutip) before use.** A planar case
 does not count as that gate.
 
+★ This contract binds ``U_mid`` exactly as much as it binds the ``U_edge``
+scan -- ``U_mid[k]`` is ``(half step at cell k) @ U_left[k]``, half step
+(later) on the left. From Step 11 through F01, ``chain()`` had this backwards
+(``U_left @ half_step``), degrading ``U_mid`` -- and everything built from it
+(``tangent``, ``r_mid``, ``closure``, ``area``, F01's ``tantrix_area`` /
+``leakage_amplitude``) -- from O(dt^2) to O(dt) on any genuinely non-commuting
+input, while being byte-identical on planar/collinear inputs (where it commutes
+and the order does not matter). It went undetected because the only existing
+``U_mid`` test (``test_every_propagator_is_unitary``) checks unitarity, and
+``U_1 U_2`` is exactly as unitary as ``U_2 U_1`` for unitary ``U_1, U_2`` --
+that check cannot see an ordering error at all. Fixed and regression-tested in
+F01b (see ``_dev_logs/F01b_umid_order.md``); the ``U_edge`` scan itself was
+always correct, which is why endpoint-only quantities (``propagator()``,
+``gate_residual`` on planar/general layers alike) were never affected.
+
 Time stepping uses the same midpoint rule as :mod:`curve_opt.geometry`. Float64
 is enabled process-wide by importing :mod:`curve_opt` (JAX defaults to float32,
 and every residual claim here lives at 1e-16).
@@ -42,7 +57,8 @@ with ``|Omega| ~ 0`` occur on the way to every solution, and an
 gradient.
 
 Edge and midpoint propagators come from one scan: ``U_edge`` is the scan over
-full steps, and ``U_mid = U_edge[k-1] @ (half step)``. The space curve then
+full steps, and ``U_mid = (half step) @ U_edge[k-1]`` (half step, being later in
+time, on the left -- see the ordering contract above). The space curve then
 follows the same midpoint quadrature as the planar layer, applied to the Bloch
 components of ``U^dagger sigma_z U``.
 
@@ -62,6 +78,57 @@ keeps the residual an analytic function of the coefficients.
 ``sigma_z`` noise they can: the second-order Magnus term is proportional to
 ``int r x r_dot dt`` component-wise (``_plan.md`` §10, closed by derivation in
 step01b).
+
+F01 (full-cost era): tantrix area and leakage amplitude
+---------------------------------------------------------
+Two more quantities read off the *same* forward scan -- no second propagator
+call, ever (``_plan_full_cost.md`` §2.2, ``AGENTS.md`` full-cost discipline).
+Both take a :class:`Chain3D` (or, via the ``_of_coeffs`` / ``_of_samples``
+wrappers, coefficients or raw ``(Omega_x, Omega_y)`` samples) and do pure
+elementwise algebra on its ``omega_x``, ``omega_y``, ``tangent`` and ``U_mid``
+fields -- nothing here differentiates or re-propagates.
+
+``tantrix_area`` (C3, evaluated on the *design* curve, ``_plan_full_cost.md``
+§2.3/§2.5b)::
+
+    A_T = (1/2) int_0^T [T (T . Omega) - Omega] ds ,   Omega = (Omega_x, Omega_y, 0)
+
+Sign pinned by ``_plan_full_cost.md`` §2.2 (``T_dot = T x Omega``, *not*
+``Omega x T``): in the planar limit ``T = (0, sin theta, cos theta)`` has
+``T_x = 0`` so ``T . Omega = 0`` identically, and the bracket collapses to
+``-Omega``, giving ``A_T = -(theta / 2) x_hat`` -- the closed form of §2.5b.
+No special-casing is needed for that limit; it falls out of the general
+formula because ``T . Omega`` is already zero there.
+
+``leakage_amplitude`` (C4, evaluated on the *broadcast* waveform,
+``_plan_full_cost.md`` §2.2 recollection A)::
+
+    Lambda_j = (1 / sqrt(2)) int_0^T [Omega_x(s) + i Omega_y(s)]
+               exp(i Delta s) U_c(s)[1, j] ds ,   j = 0, 1
+
+returned as the 4 real components ``[Re L0, Im L0, Re L1, Im L1]`` in that
+fixed order (later modules depend on it). ``Delta = alpha`` (negative, rad/ns,
+``curve_opt.device.Device.delta``); the exponent is ``exp(+i Delta s)``.
+``U_c(s)[1, j]`` is ``chain.U_mid[:, 1, j]`` -- row 1, i.e. ``<1|U_c(s)|j>`` --
+matching the row/column convention Novera's ``ideal_propagators`` uses
+(``pulse-shape-Novera`` git hash ``59fb616``: ``u10 = ideal_propagators(...)[:, 1, 0]``).
+No ``-i`` prefactor here (that is the v5.1 §2.2 form); Novera's
+``leakage_amplitude`` carries one, so ``novera_amplitude == -1j * Lambda_0``
+up to the two secondary differences documented at the call sites in
+``tests/test_f01_forward_chain.py`` (Novera integrates by trapezoid with edge
+propagators, this module by midpoint; ``to_physical`` is deliberately bypassed
+in that comparison).
+
+``leakage_amplitude_ddelta`` is the analytic ``d Lambda / d Delta`` -- ``U_c``
+does not depend on ``Delta``, so differentiating under the integral only
+multiplies the integrand by ``i s``::
+
+    dLambda_j/dDelta = (1 / sqrt(2)) int_0^T [Omega_x + i Omega_y] (i s)
+                        exp(i Delta s) U_c(s)[1, j] ds
+
+checked against ``jax.grad`` of :func:`leakage_amplitude` w.r.t. ``delta`` in
+the test suite (should agree to <= 1e-10, since both differentiate the same
+smooth integrand -- one symbolically, one by autodiff through the quadrature).
 """
 
 from __future__ import annotations
@@ -85,10 +152,18 @@ __all__ = [
     "equality_residuals",
     "gate_residual",
     "gate_rotation",
+    "leakage_amplitude",
+    "leakage_amplitude_ddelta",
+    "leakage_amplitude_ddelta_of_coeffs",
+    "leakage_amplitude_ddelta_of_samples",
+    "leakage_amplitude_of_coeffs",
+    "leakage_amplitude_of_samples",
     "noncommutativity",
     "omega_samples",
     "propagator",
     "su2_rotation",
+    "tantrix_area",
+    "tantrix_area_of_coeffs",
     "target_x",
     "unitarity_error",
 ]
@@ -194,7 +269,11 @@ def chain(om_x_mid, om_y_mid, T: float) -> Chain3D:
     # which is invisible unless the case is non-commuting (_plan.md §6.3).
     U_edge = jax.lax.associative_scan(lambda A, B: B @ A, steps)
     U_left = jnp.concatenate([I2[None], U_edge[:-1]])
-    U_mid = U_left @ _cell_propagators(om_x, om_y, dt, 0.5)
+    # ★ same "newest on the left" contract as U_edge above: the half-step (later
+    # in time) goes on the left of U_left (earlier). Reversed order was a
+    # pre-existing (Step 11) bug -- see F01b's dev log and the module docstring's
+    # "Numerical contract" section for the O(dt) -> O(dt^2) diagnosis.
+    U_mid = _cell_propagators(om_x, om_y, dt, 0.5) @ U_left
 
     # Bloch components of U^dagger sigma_z U at the midpoints: the space curve's
     # unit tangent, same object the planar layer builds by trigonometry.
@@ -270,6 +349,131 @@ def closure_invariant(a, b, T: float, N: int = geometry.N_DEFAULT) -> float:
 def area_invariant(a, b, T: float, N: int = geometry.N_DEFAULT) -> float:
     """``|area| / L^2`` -- a norm, since a general curve has no privileged component."""
     return float(jnp.linalg.norm(area(a, b, T, N)) / T**2)
+
+
+# --------------------------------------------------------------------------
+# F01: tantrix area (C3) and leakage amplitude (C4) -- see the module
+# docstring section "F01 (full-cost era)". Both are pure reductions of an
+# already-built Chain3D: no propagator is re-run.
+# --------------------------------------------------------------------------
+
+
+def _mid_times(c: Chain3D) -> jnp.ndarray:
+    """Cell-midpoint times ``(k + 1/2) dt`` for ``k = 0 .. N-1``.
+
+    Determined entirely by ``c.dt`` and ``N = len(c.omega_x)``, i.e. exactly
+    :func:`curve_opt.geometry.midpoint_grid`'s grid -- recomputed here rather
+    than stored on :class:`Chain3D` because it is pure arithmetic on fields
+    the chain already carries, and adding a field would touch every
+    positional construction of the namedtuple.
+    """
+    N = c.omega_x.shape[0]
+    return (jnp.arange(N, dtype=jnp.float64) + 0.5) * c.dt
+
+
+def tantrix_area(c: Chain3D) -> jnp.ndarray:
+    """``A_T = (1/2) int_0^T [T (T . Omega) - Omega] ds``, shape (3,).
+
+    C3 (``_plan_full_cost.md`` §2.3): the leading-order amplitude-error
+    invariant, evaluated on the **design** curve. Pure algebra on ``c.tangent``
+    and the field samples ``c.omega_x, c.omega_y`` -- midpoint sum, no
+    derivative, no second propagator call (§2.2 recollection B). Planar limit:
+    ``T . Omega = 0`` identically (``T_x = 0``), so this reduces to
+    ``-(theta / 2) x_hat`` with no special-casing, matching §2.5b's closed
+    form.
+    """
+    zero = jnp.zeros_like(c.omega_x)
+    omega = jnp.stack([c.omega_x, c.omega_y, zero], axis=-1)
+    dot = jnp.sum(c.tangent * omega, axis=-1, keepdims=True)
+    integrand = c.tangent * dot - omega
+    return 0.5 * jnp.sum(integrand, axis=0) * c.dt
+
+
+def tantrix_area_of_coeffs(a, b, T: float, N: int = geometry.N_DEFAULT) -> jnp.ndarray:
+    """:func:`tantrix_area` from sine-series coefficients -- runs :func:`chain` once."""
+    return tantrix_area(_chain_of_coeffs(a, b, T, N))
+
+
+def _leakage_amplitude_complex(c: Chain3D, delta: float) -> jnp.ndarray:
+    """``Lambda`` as a complex 2-vector ``[Lambda_0, Lambda_1]`` -- shared core
+    of :func:`leakage_amplitude` and the real/imaginary bookkeeping the public
+    API exposes. See the module docstring for the formula.
+    """
+    s = _mid_times(c)
+    envelope = c.omega_x + 1j * c.omega_y
+    phase = jnp.exp(1j * jnp.asarray(delta, dtype=jnp.float64) * s)
+    weight = envelope * phase * c.dt
+    row1 = c.U_mid[:, 1, :]  # (N, 2): U_c(s)[1, 0], U_c(s)[1, 1]
+    return jnp.sum(weight[:, None] * row1, axis=0) / jnp.sqrt(2.0)
+
+
+def _to_real4(lam: jnp.ndarray) -> jnp.ndarray:
+    """Complex 2-vector -> ``[Re L0, Im L0, Re L1, Im L1]`` -- the fixed order
+    the module docstring pins.
+    """
+    return jnp.stack(
+        [jnp.real(lam[0]), jnp.imag(lam[0]), jnp.real(lam[1]), jnp.imag(lam[1])]
+    )
+
+
+def leakage_amplitude(c: Chain3D, delta: float) -> jnp.ndarray:
+    """C4 leakage amplitude, shape (4,): ``[Re L0, Im L0, Re L1, Im L1]``.
+
+    ``Lambda_j = (1/sqrt2) int_0^T [Omega_x + i Omega_y] exp(i delta s)
+    U_c(s)[1, j] ds``, ``j = 0, 1``. Evaluated on the **broadcast** waveform
+    (``_plan_full_cost.md`` §2.3, "求值对象"): pass a ``Chain3D`` built from
+    the played-out ``(Omega_x, Omega_y)``, not necessarily the design curve.
+    See the module docstring for the Novera cross-check (``-1j`` prefactor
+    difference) and the sign/exponent convention.
+    """
+    return _to_real4(_leakage_amplitude_complex(c, delta))
+
+
+def leakage_amplitude_of_coeffs(
+    a, b, T: float, delta: float, N: int = geometry.N_DEFAULT
+) -> jnp.ndarray:
+    """:func:`leakage_amplitude` from sine-series coefficients -- runs :func:`chain` once."""
+    return leakage_amplitude(_chain_of_coeffs(a, b, T, N), delta)
+
+
+def leakage_amplitude_of_samples(om_x_mid, om_y_mid, T: float, delta: float) -> jnp.ndarray:
+    """:func:`leakage_amplitude` from raw ``(Omega_x, Omega_y)`` midpoint samples.
+
+    Parametrization-free, like :func:`chain` itself -- the entry point F02's
+    DRAG/Stark-corrected broadcast waveform (not expressible as sine-series
+    coefficients) will use. Runs :func:`chain` once.
+    """
+    return leakage_amplitude(chain(om_x_mid, om_y_mid, T), delta)
+
+
+def leakage_amplitude_ddelta(c: Chain3D, delta: float) -> jnp.ndarray:
+    """Analytic ``d Lambda / d delta``, shape (4,), same real-component order.
+
+    ``U_c`` does not depend on ``delta``, so this is the same integral with an
+    extra ``(i s)`` factor -- see the module docstring. Cross-checked against
+    ``jax.grad`` of :func:`leakage_amplitude` in the test suite.
+    """
+    s = _mid_times(c)
+    envelope = c.omega_x + 1j * c.omega_y
+    phase = jnp.exp(1j * jnp.asarray(delta, dtype=jnp.float64) * s)
+    weight = envelope * (1j * s) * phase * c.dt
+    row1 = c.U_mid[:, 1, :]
+    lam = jnp.sum(weight[:, None] * row1, axis=0) / jnp.sqrt(2.0)
+    return _to_real4(lam)
+
+
+def leakage_amplitude_ddelta_of_coeffs(
+    a, b, T: float, delta: float, N: int = geometry.N_DEFAULT
+) -> jnp.ndarray:
+    """:func:`leakage_amplitude_ddelta` from sine-series coefficients."""
+    return leakage_amplitude_ddelta(_chain_of_coeffs(a, b, T, N), delta)
+
+
+def leakage_amplitude_ddelta_of_samples(
+    om_x_mid, om_y_mid, T: float, delta: float
+) -> jnp.ndarray:
+    """:func:`leakage_amplitude_ddelta` from raw ``(Omega_x, Omega_y)`` midpoint samples."""
+    return leakage_amplitude_ddelta(chain(om_x_mid, om_y_mid, T), delta)
 
 
 def equality_residuals(a, b, T: float, N: int = geometry.N_DEFAULT, U_target=None):

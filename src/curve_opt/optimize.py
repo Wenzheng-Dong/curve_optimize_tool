@@ -89,10 +89,11 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from scipy.optimize import BFGS, LinearConstraint, NonlinearConstraint, minimize
+from scipy.optimize import BFGS, Bounds, LinearConstraint, NonlinearConstraint, minimize
 from scipy.sparse import csr_matrix
 
-from curve_opt import basis, geometry, metrics, propagate
+from curve_opt import basis, budget, gate, geometry, metrics, novera, parametrization, propagate
+from curve_opt.device import DEFAULT_DEVICE, Device
 
 __all__ = [
     "EarlyStop",
@@ -101,13 +102,19 @@ __all__ = [
     "N_CLAIM",
     "N_CLAIM_3D",
     "N_SURVEY",
+    "BudgetProblem",
+    "BudgetSolveResult",
+    "GATE_LEVELS",
     "Problem",
     "SolveResult",
+    "budget_manifest_for",
     "extra_constraint_residuals",
     "manifest_for",
     "reevaluate",
+    "reevaluate_budget",
     "snap_winding_branch",
     "solve",
+    "solve_budget",
 ]
 
 #: Optimization grid for a claim-run: what step00d used, and what makes the
@@ -791,6 +798,962 @@ def solve(
             equality_residuals=out.equality_residuals,
             epigraph_s=s_final,
             fine_grid=fine,
+            terms=out.terms._asdict(),
+            void_for_claims=out.void_for_claims,
+        )
+    return out
+
+
+# ==========================================================================
+# F04: the full-cost era's budget-mode problem
+# ==========================================================================
+# ``_plan_full_cost.md`` §2.4/§4.2: gate is the only hard constraint, C1-C4
+# are a soft weighted sum (:mod:`curve_opt.budget`), evaluated over a
+# genuinely different free-parameter set -- (a, c, Phi_0, Phi_vz), not (a, b)
+# -- than :class:`Problem` above. Kept as a *separate* NamedTuple and solver
+# entry point rather than folded into :class:`Problem`/:func:`solve`: the two
+# problems share almost no field semantics (the gate can no longer be
+# affinely eliminated, closure/area are not equality constraints any more,
+# the objective is not the analytic quadratic §3.1 built the mandatory
+# configuration around), and every one of the 25+ existing tests in
+# ``tests/test_optimize.py`` constructs ``Problem(...)`` without any of this
+# step's new fields -- overloading one NamedTuple with a mode flag would put
+# all of that at risk for a feature that shares only the solver library and
+# the general shape of "assemble scipy objects, call trust-constr". See
+# ``_dev_logs/F04_budget_objective.md`` for the alternative considered.
+#
+# Recorder integration (F05-pre): :func:`solve_budget`'s callback calls
+# :meth:`curve_opt.recorder.Recorder.append_budget`, the ``schema_version`` 2
+# writer added alongside the energy-era ``append`` rather than folded into it
+# -- the two histories do not share a row shape (``coeffs_a``/``coeffs_c`` vs
+# ``coeffs_a``/``coeffs_b``, ``cost_c1``..``cost_c4`` vs
+# ``cost_energy``/``cost_curv``/``cost_peak``). A caller wanting a run on disk
+# must construct ``Recorder(run_id, budget_manifest_for(problem), schema="budget")``;
+# passing an energy-schema ``Recorder`` here raises (``append_budget`` checks
+# ``self.schema``), rather than silently writing the wrong columns.
+
+GATE_LEVELS = ("three_level", "two_level")
+OBJECTIVE_MODES = ("budget", "ad_exact", "ad_robust")
+
+
+class BudgetProblem(NamedTuple):
+    """One F04 error-budget optimization problem. Pure data, no solver state.
+
+    Free parameters ``x = [a (M), c (M), Phi_0 (1), Phi_vz (1), s (1), r (1)]``,
+    ``n_coeffs = 2M + 2`` physical parameters plus two epigraph slacks: ``s``
+    (the peak, task brief §2.3: 2M + 2 = 42 at M = 20) and ``r``, the F05b R
+    guard's ``max|tau|`` bound (``_plan_full_cost.md`` §5.4).
+    """
+
+    M: int
+    T: float
+    theta: float
+    """Exact winding-branch value, the right-hand side of ``U_target = target_x(theta)``."""
+    coeffs0_a: np.ndarray
+    """Starting coefficients for kappa (the design curvature series)."""
+    coeffs0_c: np.ndarray
+    """Starting coefficients for Phi's shifted-cosine series (the design torsion)."""
+    Phi_0_0: float = 0.0
+    phi_vz_0: float = 0.0
+    device: Device = DEFAULT_DEVICE
+    gate_level: str = "three_level"
+    """``"three_level"`` (default, claim-eligible): G measured on
+    :func:`curve_opt.gate.three_level_propagator`'s qubit block via
+    :func:`curve_opt.gate.polar_gate_residual`. ``"two_level"``: G measured
+    on the plain SU(2) propagator of the broadcast waveform via
+    :func:`curve_opt.propagate.gate_residual` -- a fast warm-start channel
+    only (task brief §2.3), never for a claim.
+    """
+    N_grid: int = geometry.N_DEFAULT
+    """Shared grid for the design chain (C1/C2/C3), the broadcast chain
+    (C4, the two-level gate route) and, when ``gate_level="three_level"``,
+    :func:`curve_opt.gate.three_level_propagator`. One grid, not three, so
+    every term of one forward pass is mutually consistent (module docstring
+    of :mod:`curve_opt.budget`: two chains, not three)."""
+    n_peak: int = 400
+    """Coarser grid the peak epigraph inequality is sampled on -- same
+    economy-grid rationale as :class:`Problem`'s field of the same name. The
+    R guard (F05b) reuses this same grid for ``tau``: ``tau`` is band-limited
+    by the same ``M`` harmonics ``kappa`` is, so the economy-grid argument
+    that justifies sampling ``|Omega|`` on ``n_peak`` points applies to
+    ``|tau|`` unchanged -- no separate grid parameter is introduced."""
+    rho: float = 0.5
+    """F05b R guard: hard cap ``max|tau| <= rho * |Delta| / 2``
+    (``_plan_full_cost.md`` §5.4). Default 0.5, so the cap is ``0.25 |Delta|``
+    -- the *same* fractional scale as this device's own drive perturbation
+    parameter ``eta = Omega_max / |Delta| = 0.25`` (:attr:`Device.eta`), which
+    is the perturbation parameter the readout map's own DRAG expansion is
+    already trusted at. Ties the two small parameters the readout map
+    (``curve_opt.parametrization.drag_stark_quadratures``) depends on --
+    drive amplitude (``eta``) and torsion (``tau/Delta``) -- to one order of
+    smallness, rather than picking an unrelated number. ★ Chosen from this
+    perturbative-validity argument alone, before any guarded ``rcp+3D``
+    construction run existed to check against (task brief F05b §5: "不许调
+    rho 去让 ②通过")."""
+    fluence_cap: float | None = None
+    """F06b hard fluence cap: ``int_0^T kappa^2 dt <= fluence_cap``, ``kappa``
+    being the *design*-curve coefficients ``a`` (``_dev_logs/F06b_task_brief.md``
+    §2). ``None`` (default) disables the constraint entirely, reproducing every
+    pre-F06b run bit-for-bit. Deliberately a hard inequality, not a
+    lambda-weighted soft term: the task brief's own reasoning is that no
+    noise moment determines a weight for it (it is not a budget item, it is a
+    guard for staying inside the perturbative regime C1-C4 are derived in --
+    same status as the peak epigraph and the F05b R guard). Convex quadratic
+    in ``a`` alone (``basis.energy_invariant``/``_gradient``/``_hessian``,
+    rescaled from that module's ``T=1``-normalized convention -- see
+    :func:`_budget_fluence_constraint`), so unlike the gate/peak/R-guard
+    blocks this one needs no epigraph and no Gauss-Newton approximation: its
+    Hessian is exact and constant, supplied to ``trust-constr`` regardless of
+    :attr:`hessian_mode` (mirrors the energy-era ``Problem``'s ``bandwidth``
+    ``extra_constraints`` kind, ``_nonlinear_constraint``'s sibling function
+    `_extra_constraint_objects`)."""
+    e0_cap: float | None = None
+    """F06f hard cap on the zero-noise infidelity: ``infid(x, 0, 0) <= e0_cap``
+    (``_dev_logs/F06f_task_brief.md`` §2). ``None`` (default) disables the
+    constraint, reproducing every pre-F06f run bit-for-bit. Only meaningful
+    together with ``objective_mode="ad_robust"``, whose objective drops the
+    zero-noise term entirely (see that mode's docstring below) -- without a
+    cap nothing would stop the solver from trading away e0 for sensitivity.
+    A *positive-margin* inequality (the constraint function is nonzero, with
+    nonzero gradient, everywhere on its active boundary), not the scalar
+    ``1-Fbar=0`` equality the numerical red lines forbid: same status as the
+    fluence cap and the R guard, not the gate."""
+    hessian_mode: str = "gauss_newton"
+    maxiter: int = 3000
+    fixed_budget_survey: bool = False
+    gtol: float = 1e-12
+    xtol: float = 1e-14
+    checkpoint_every: int = 1
+    target_gate: dict | None = None
+    ansatz: dict | None = None
+    objective_mode: str = "budget"
+    """``"budget"`` (default): the F04 surrogate ``C1+C2+C3+C4`` from
+    :func:`curve_opt.budget.residual_vector`. ``"ad_exact"`` (F06e): the
+    second-order noise expansion of the *true* three-level expected
+    infidelity, ``J = (1-Fbar)(0,0) + (1/2)<delta_z^2> d2/d(delta_z)^2 (1-Fbar)
+    + (1/2)<eps^2> d2/d(eps)^2 (1-Fbar)``, every term computed through
+    :func:`curve_opt.gate.three_level_propagator` by forward-mode AD. Exact
+    by construction at first order in each noise channel -- no design-curve
+    surrogate, hence immune to the tau != 0 readout-map truncation the F06d
+    screening located (the C3/C4 formulas stay reporting quantities).
+    ``"ad_robust"`` (F06f): the same second-order expansion with the
+    zero-noise term ``(1-Fbar)(0,0)`` dropped, ``J_rob = (1/2)<delta_z^2>
+    d2/d(delta_z)^2 (1-Fbar) + (1/2)<eps^2> d2/d(eps)^2 (1-Fbar)`` --
+    minimizing *sensitivity* alone rather than a weighted sum that lets the
+    zero-noise term dominate. Pairs with :attr:`e0_cap` as a hard fuse so
+    leakage cannot silently regrow while the objective no longer prices it.
+    The hard-constraint set (gate / c1 / peak / R guard / fluence cap /
+    e0 cap) is identical across all three modes."""
+
+    @property
+    def n_coeffs(self) -> int:
+        return 2 * self.M + 2
+
+    @property
+    def n_vars(self) -> int:
+        """Solver-vector length: :attr:`n_coeffs` plus the two epigraph slacks ``s``, ``r``."""
+        return self.n_coeffs + 2
+
+    @property
+    def tau_guard_bound(self) -> float:
+        """``rho * |Delta| / 2`` -- the R guard's hard cap on ``max|tau|``."""
+        return float(self.rho) * abs(self.device.delta) / 2.0
+
+
+class BudgetSolveResult(NamedTuple):
+    """Outcome of one :func:`solve_budget` call."""
+
+    coeffs_a: np.ndarray
+    coeffs_c: np.ndarray
+    Phi_0: float
+    phi_vz: float
+    s: float
+    r: float
+    """The R guard epigraph slack (raw solver value) -- mirrors ``s``. Not
+    necessarily tight (nothing in the objective drives it down, same as
+    ``s``), so :attr:`tau_peak` is the value to report/check, not this one
+    (mirrors :attr:`peak_phys` vs ``s``)."""
+    stop_reason: str
+    status: int
+    nit: int
+    wall_clock_s: float
+    terms: budget.BudgetTerms
+    gate_residual: np.ndarray
+    c1_residual: np.ndarray
+    peak_phys: float
+    tau_peak: float
+    """``max|tau|`` measured directly from ``coeffs_c`` on the ``n_peak``
+    grid (the grid the R guard constraint was built on -- same rationale as
+    :attr:`peak_phys`'s docstring at the call site: reporting on a finer grid
+    than the constraint used can show an apparent, grid-resolution-only,
+    overshoot)."""
+    polar_margin: float | None
+    scipy_message: str
+    fixed_budget_survey: bool = False
+
+    @property
+    def void_for_claims(self) -> bool:
+        return self.stop_reason != "converged" or self.fixed_budget_survey
+
+
+def _split_budget(problem: BudgetProblem, x):
+    """Solver vector -> ``(a, c, Phi_0, phi_vz, s, r)``."""
+    M = problem.M
+    a = x[:M]
+    c = x[M : 2 * M]
+    Phi_0 = x[2 * M]
+    phi_vz = x[2 * M + 1]
+    s = x[2 * M + 2]
+    r = x[2 * M + 3]
+    return a, c, Phi_0, phi_vz, s, r
+
+
+def _budget_x0(problem: BudgetProblem) -> np.ndarray:
+    """Initial solver vector: the given starting coefficients plus measured ``s0``, ``r0``.
+
+    ``s0`` is the actual peak of the initial broadcast waveform on the peak
+    grid, clipped into ``[0, Omega_max]``; ``r0`` (F05b) is the actual
+    ``max|tau|`` of the initial ``c`` on the same grid, clipped into
+    ``[0, tau_guard_bound]`` -- trust-constr does not require an
+    inequality-feasible start, but starting a slack at a value the
+    ``Bounds`` object already rejects would be a needless own goal.
+    """
+    a0 = np.asarray(problem.coeffs0_a, dtype=float)
+    c0 = np.asarray(problem.coeffs0_c, dtype=float)
+    om_x0, om_y0 = budget.broadcast_waveform(
+        a0, c0, problem.Phi_0_0, problem.T, problem.device.delta, problem.n_peak
+    )
+    s0 = float(np.max(np.hypot(np.asarray(om_x0), np.asarray(om_y0))))
+    s0 = float(np.clip(s0, 0.0, problem.device.rabi_max_rate))
+    tau0 = np.asarray(parametrization.tau_of_coeffs(c0, problem.T, problem.n_peak))
+    r0 = float(np.max(np.abs(tau0))) if tau0.size else 0.0
+    r0 = float(np.clip(r0, 0.0, problem.tau_guard_bound))
+    return np.concatenate([a0, c0, [problem.Phi_0_0, problem.phi_vz_0, s0, r0]])
+
+
+def _budget_bounds(problem: BudgetProblem) -> Bounds:
+    """``s`` bounded in ``[0, Omega_max]`` (the hardware ceiling), ``r`` bounded
+    in ``[0, tau_guard_bound]`` (F05b's R guard, ``_plan_full_cost.md`` §5.4);
+    everything else is free -- the epigraph mechanism this reuses (module
+    docstring of :class:`Problem`), specialized to *fixed* physical ceilings
+    rather than an objective-weighted tradeoff (task brief §2.3: peak, and
+    now the R guard, are hard inequalities here, not lambda-weighted
+    objective terms)."""
+    n = problem.n_vars
+    lb = np.full(n, -np.inf)
+    ub = np.full(n, np.inf)
+    lb[-2] = 0.0
+    ub[-2] = problem.device.rabi_max_rate
+    lb[-1] = 0.0
+    ub[-1] = problem.tau_guard_bound
+    return Bounds(lb, ub)
+
+
+def _budget_objective(problem: BudgetProblem):
+    """Value / analytic gradient / Gauss-Newton Hessian of ``C = R . R``.
+
+    ``R`` = :func:`curve_opt.budget.residual_vector` -- see that module's
+    docstring for why ``C`` being literally a sum of squares makes
+    ``2 J_R^T J_R`` (dropping ``R``'s own second derivative) the natural
+    Gauss-Newton objective Hessian, the same approximation the constraint
+    block has used for its Hessian since Step 08.
+
+    ``fun``/``jac``/``hess`` share one ``(R(x), J_R(x))`` cache keyed on the
+    last ``x`` seen: ``trust-constr`` calls all three at the same point far
+    more often than not, and without the cache ``jac`` and ``hess`` each ran
+    their own ``jax.jacrev`` pass -- a genuine 2x in wall clock that muddied
+    the very Gauss-Newton-vs-``default`` comparison this Hessian exists to
+    win (acceptance criterion 3; see ``_dev_logs/F04_budget_objective.md``).
+    """
+    T, N, device = problem.T, problem.N_grid, problem.device
+
+    def residual(x):
+        a, c, Phi_0, _phi_vz, _s, _r = _split_budget(problem, x)
+        return budget.residual_vector(a, c, Phi_0, T, device, N)
+
+    R = jax.jit(residual)
+    JR = jax.jit(jax.jacrev(residual))
+
+    cache = {"x": None, "r": None, "J": None}
+
+    def _refresh(x):
+        x = np.asarray(x, dtype=float)
+        if cache["x"] is None or not np.array_equal(cache["x"], x):
+            xj = jnp.asarray(x)
+            cache["x"] = x
+            cache["r"] = np.asarray(R(xj))
+            cache["J"] = np.asarray(JR(xj))
+
+    def fun(x):
+        _refresh(x)
+        r = cache["r"]
+        return float(r @ r)
+
+    def jac(x):
+        _refresh(x)
+        r, J = cache["r"], cache["J"]
+        return 2.0 * (J.T @ r)
+
+    def hess(x):
+        _refresh(x)
+        J = cache["J"]
+        return 2.0 * (J.T @ J)
+
+    return fun, jac, hess
+
+
+_PAULI4_AD = [
+    jnp.eye(2, dtype=jnp.complex128),
+    jnp.array([[0.0, 1.0], [1.0, 0.0]], dtype=jnp.complex128),
+    jnp.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=jnp.complex128),
+    jnp.array([[1.0, 0.0], [0.0, -1.0]], dtype=jnp.complex128),
+]
+
+
+def _block_avg_infidelity(B, target):
+    """``1 - Fbar`` of a (possibly non-unitary) qubit block against a unitary target.
+
+    Same four-Pauli average-gate-fidelity sum used everywhere else in the
+    repo (``F05_budget_validation._fidelity_jax``); traced here so it can be
+    differentiated to third order (grad of a second derivative) in
+    :func:`_budget_objective_ad`.
+    """
+    tot = 0.0
+    for P in _PAULI4_AD:
+        tot = tot + jnp.real(
+            jnp.trace((target @ P @ jnp.conj(target).T) @ (B @ P @ jnp.conj(B).T))
+        )
+    return 1.0 - (tot + 4.0) / 12.0
+
+
+def _d2_at_zero(f, x):
+    """``d^2/du^2 f(x, u)|_{u=0}`` via forward-over-forward JVP (jvp of a jvp)."""
+    def first(v):
+        return jax.jvp(lambda u: f(x, u), (v,), (1.0,))[1]
+    return jax.jvp(first, (0.0,), (1.0,))[1]
+
+
+def _budget_infid_closure(problem: BudgetProblem):
+    """Shared ``infid(x, dz, eps)`` closure and noise moments for the ``ad_exact``/
+    ``ad_robust`` objectives and the :attr:`BudgetProblem.e0_cap` guard.
+
+    ``infid`` is the three-level block infidelity of the broadcast waveform
+    under quasi-static Z noise ``dz`` and amplitude scaling ``(1+eps)``, at
+    the (optimized, frozen-per-evaluation) ``phi_vz`` -- see
+    :func:`_budget_objective_ad`'s docstring for the physics. Noise moments
+    come from :func:`curve_opt.budget.weights_from_device`: ``w1 = <dz^2>/6``
+    and ``w3 = (2/3)<eps^2>`` (tex Eq. (budget)).
+    """
+    T, N, device = problem.T, problem.N_grid, problem.device
+    U_t = jnp.asarray(propagate.target_x(problem.theta), dtype=jnp.complex128)
+    w = budget.weights_from_device(device)
+    var_dz = 6.0 * float(w.c1)
+    var_eps = 1.5 * float(w.c3)
+
+    def infid(x, dz, eps):
+        a, c, Phi_0, phi_vz, _s, _r = _split_budget(problem, x)
+        om_x, om_y = budget.broadcast_waveform(a, c, Phi_0, T, device.delta, N)
+        U3 = gate.three_level_propagator(
+            om_x * (1.0 + eps), om_y * (1.0 + eps), T, device.delta, delta_z=dz
+        )
+        return _block_avg_infidelity(gate.qubit_block(U3), gate.rz(phi_vz) @ U_t)
+
+    return infid, var_dz, var_eps
+
+
+def _budget_objective_ad(problem: BudgetProblem):
+    """F06e ``objective_mode="ad_exact"``: true-model expected infidelity to O(noise^2).
+
+    ``J(x) = infid(0,0) + (1/2)<dz^2> d2_dz infid + (1/2)<eps^2> d2_eps infid``.
+    The second derivatives are forward-over-forward JVPs; the parameter
+    gradient is one reverse pass over the whole expression. No Gauss-Newton
+    structure exists here, so the solver runs BFGS on the objective (the
+    constraint blocks keep their own exact/GN Hessians unchanged).
+    """
+    infid, var_dz, var_eps = _budget_infid_closure(problem)
+
+    def total(x):
+        return (
+            infid(x, 0.0, 0.0)
+            + 0.5 * var_dz * _d2_at_zero(lambda xx, u: infid(xx, u, 0.0), x)
+            + 0.5 * var_eps * _d2_at_zero(lambda xx, u: infid(xx, 0.0, u), x)
+        )
+
+    fun_j = jax.jit(total)
+    jac_j = jax.jit(jax.grad(total))
+
+    def fun(x):
+        return float(fun_j(jnp.asarray(x, dtype=float)))
+
+    def jac(x):
+        return np.asarray(jac_j(jnp.asarray(x, dtype=float)))
+
+    return fun, jac, None
+
+
+def _budget_objective_ad_robust(problem: BudgetProblem):
+    """F06f ``objective_mode="ad_robust"``: sensitivity alone, zero-noise term dropped.
+
+    ``J_rob(x) = (1/2)<dz^2> d2_dz infid + (1/2)<eps^2> d2_eps infid`` -- the
+    same closure and second-order JVPs :func:`_budget_objective_ad` uses,
+    minus the ``infid(x, 0, 0)`` term. The zero-noise level is left to
+    :attr:`BudgetProblem.e0_cap` (a hard fuse, not a soft price) rather than
+    the objective, per the task brief's diagnosis that mixing the two into
+    one weighted sum let the zero-noise term dominate the tradeoff.
+    """
+    infid, var_dz, var_eps = _budget_infid_closure(problem)
+
+    def total(x):
+        return (
+            0.5 * var_dz * _d2_at_zero(lambda xx, u: infid(xx, u, 0.0), x)
+            + 0.5 * var_eps * _d2_at_zero(lambda xx, u: infid(xx, 0.0, u), x)
+        )
+
+    fun_j = jax.jit(total)
+    jac_j = jax.jit(jax.grad(total))
+
+    def fun(x):
+        return float(fun_j(jnp.asarray(x, dtype=float)))
+
+    def jac(x):
+        return np.asarray(jac_j(jnp.asarray(x, dtype=float)))
+
+    return fun, jac, None
+
+
+def _budget_e0_constraint(problem: BudgetProblem) -> NonlinearConstraint:
+    """F06f fuse: ``infid(x, 0, 0) <= e0_cap``, reverse-AD gradient, BFGS Hessian.
+
+    A positive-margin inequality on the *same* zero-noise infidelity
+    :func:`_budget_objective_ad`'s first term names -- its gradient does not
+    vanish generically on the active boundary (unlike the scalar ``1-Fbar=0``
+    equality the numerical red lines forbid: that residual's gradient *does*
+    vanish at its own zero, which is the whole reason it is banned as a hard
+    constraint). Built only when :attr:`BudgetProblem.e0_cap` is not ``None``.
+    """
+    cap = float(problem.e0_cap)
+    infid, _var_dz, _var_eps = _budget_infid_closure(problem)
+
+    def value(x):
+        return jnp.reshape(infid(x, 0.0, 0.0), (1,))
+
+    fun_j = jax.jit(value)
+    jac_j = jax.jit(jax.jacrev(value))
+
+    return NonlinearConstraint(
+        lambda x: np.asarray(fun_j(jnp.asarray(x, dtype=float))),
+        -np.inf,
+        cap,
+        jac=lambda x: np.asarray(jac_j(jnp.asarray(x, dtype=float))),
+        hess=BFGS(),
+    )
+
+
+def _budget_gate_constraint(problem: BudgetProblem):
+    """The hard gate equality (3 components), dispatched on :attr:`BudgetProblem.gate_level`."""
+    T, N, device = problem.T, problem.N_grid, problem.device
+    U_target = propagate.target_x(problem.theta)
+    n = problem.n_vars
+    level = problem.gate_level
+    if level not in GATE_LEVELS:
+        raise ValueError(f"gate_level must be one of {GATE_LEVELS}, got {level!r}")
+
+    def residual(x):
+        a, c, Phi_0, phi_vz, _s, _r = _split_budget(problem, x)
+        om_x, om_y = budget.broadcast_waveform(a, c, Phi_0, T, device.delta, N)
+        if level == "three_level":
+            U3 = gate.three_level_propagator(om_x, om_y, T, device.delta)
+            res, _W, _P = gate.polar_gate_residual(U3, U_target, phi_vz)
+        else:
+            chain2 = propagate.chain(om_x, om_y, T)
+            target = gate.rz(phi_vz) @ jnp.asarray(U_target, dtype=jnp.complex128)
+            res = propagate.gate_residual(chain2.U_edge[-1], target)
+        return res
+
+    fun = jax.jit(residual)
+    jac = jax.jit(jax.jacrev(residual))
+
+    if problem.hessian_mode == "gauss_newton":
+        zeros = csr_matrix((n, n))
+
+        def hess(x, v):
+            return zeros
+
+    else:
+        hess = BFGS()
+
+    return NonlinearConstraint(
+        lambda x: np.asarray(fun(jnp.asarray(x))),
+        0.0,
+        0.0,
+        jac=lambda x: np.asarray(jac(jnp.asarray(x))),
+        hess=hess,
+    )
+
+
+def _budget_c1_constraint(problem: BudgetProblem) -> LinearConstraint:
+    """The free linear ``P`` endpoint condition on ``a`` alone (2 rows).
+
+    ``basis.c1_row(M, T, 'start'/'end') . a = 0`` -- exact and free, the same
+    row :class:`Problem`'s ``extra_constraints={"kind": "c1", ...}`` already
+    uses. ``c`` never needs it (:mod:`curve_opt.parametrization`'s docstring,
+    "The c1 guard is an entry ticket"): ``tau``'s series is a sine series
+    like kappa's and is structurally zero at both ends for any ``c``.
+    """
+    M, T = problem.M, problem.T
+    n = problem.n_vars
+    rows = np.stack([basis.c1_row(M, T, "start"), basis.c1_row(M, T, "end")])
+    A = np.zeros((2, n))
+    A[:, :M] = rows
+    return LinearConstraint(A, 0.0, 0.0)
+
+
+def _budget_peak_constraint(problem: BudgetProblem):
+    """``Omega_x_out(t_k)^2 + Omega_y_out(t_k)^2 - s^2 <= 0`` on the peak grid.
+
+    Second-order cone, exactly :class:`Problem`'s general-layer epigraph
+    block but evaluated on the *broadcast* waveform (task brief §2.1: G/C4/
+    peak share the broadcast object) at :attr:`BudgetProblem.n_peak` grid
+    points via a fresh, coarser call to :func:`curve_opt.budget.broadcast_waveform`
+    (:mod:`curve_opt.parametrization`'s functions accept an arbitrary ``N``,
+    so this needs no new machinery).
+    """
+    T, device, n_peak = problem.T, problem.device, problem.n_peak
+    n = problem.n_vars
+
+    def cone(x):
+        a, c, Phi_0, _phi_vz, s, _r = _split_budget(problem, x)
+        om_x, om_y = budget.broadcast_waveform(a, c, Phi_0, T, device.delta, n_peak)
+        return om_x ** 2 + om_y ** 2 - s ** 2
+
+    fun = jax.jit(cone)
+    jac = jax.jit(jax.jacrev(cone))
+
+    if problem.hessian_mode == "gauss_newton":
+        zeros = csr_matrix((n, n))
+
+        def hess(x, v):
+            return zeros
+
+    else:
+        hess = BFGS()
+
+    return NonlinearConstraint(
+        lambda x: np.asarray(fun(jnp.asarray(x))),
+        -np.inf,
+        0.0,
+        jac=lambda x: np.asarray(jac(jnp.asarray(x))),
+        hess=hess,
+    )
+
+
+def _tau_design_matrix(M: int, T: float, N: int) -> np.ndarray:
+    """The ``(N, M)`` constant matrix ``S_tau`` with ``S_tau @ c == tau_of_coeffs(c, T, N)``.
+
+    ``tau_of_coeffs`` (:mod:`curve_opt.parametrization`) is *exactly* linear
+    in ``c`` (its own docstring: "a second Fourier series"), so its Jacobian
+    at any point -- taken here at ``c = 0`` via ``jax.jacrev``, once per
+    constraint build, not per solver iteration -- *is* the whole map, read
+    off automatically rather than re-derived by hand. That matters because
+    the sign of the readout map this feeds (``drag_stark_quadratures``) was
+    itself the subject of a real bug (F05-redo): building the R guard's
+    matrix from :func:`curve_opt.parametrization.tau_of_coeffs` directly
+    means it can never drift out of sync with that module's own convention.
+    """
+    zero = jnp.zeros(M)
+    jac = jax.jacrev(lambda c: parametrization.tau_of_coeffs(c, T, N))
+    return np.asarray(jac(zero))
+
+
+def _budget_tau_guard_constraint(problem: BudgetProblem) -> LinearConstraint:
+    """F05b R guard: ``max_s |tau(s)| <= rho * |Delta| / 2`` (``_plan_full_cost.md`` §5.4).
+
+    Epigraph, mirroring :func:`_epigraph_constraints`'s planar peak block
+    (task brief F05b: "走 epigraph（辅助变量 + 线性不等式），照 optimize.py
+    里 peak epigraph 的现成模式"): the auxiliary slack ``r`` (last entry of
+    the solver vector, bounded to ``[0, tau_guard_bound]`` by
+    :func:`_budget_bounds`) is linked to ``tau`` by two blocks of *linear*
+    inequalities on the same economy ``n_peak`` grid the ``Omega`` epigraph
+    already samples (``tau`` is band-limited by the same ``M`` harmonics
+    ``kappa`` is -- :class:`BudgetProblem.n_peak`'s docstring):
+
+        S_tau @ c - r <= 0
+        -S_tau @ c - r <= 0
+
+    i.e. ``|tau(t_k)| <= r`` at every sampled ``t_k``. ``tau`` depends only
+    on ``c`` (:mod:`curve_opt.parametrization`'s module docstring: ``a``
+    carries ``kappa``, ``c`` carries ``Phi``/``tau``), so this is a genuine
+    ``LinearConstraint`` -- no ``NonlinearConstraint``/Jacobian machinery is
+    needed at all, and the objective stays exactly as smooth as before
+    (AGENTS.md numerical discipline 7).
+
+    This diagnoses a real, already-observed failure mode (task brief
+    F05b §2): without it, ``solve_budget``'s ``general`` layer is free to
+    push ``tau`` toward ``-Delta`` (the readout map's own pole,
+    ``kappa_y = -kappa_dot / (Delta + tau)``), which the F05-redo `rcp+3D`
+    construction run in fact did (``max|tau| = 1.931x |Delta|/2``,
+    ``min|Delta+tau| = 5.77%`` of ``|Delta|``) -- not because any of the
+    three existing hard constraints (G, P, peak) were violated, but because
+    none of them ever bounded ``tau`` at all.
+    """
+    M, T, n_peak = problem.M, problem.T, problem.n_peak
+    n = problem.n_vars
+    S_tau = _tau_design_matrix(M, T, n_peak)
+    A_pos = np.zeros((n_peak, n))
+    A_pos[:, M : 2 * M] = S_tau
+    A_pos[:, -1] = -1.0
+    A_neg = np.zeros((n_peak, n))
+    A_neg[:, M : 2 * M] = -S_tau
+    A_neg[:, -1] = -1.0
+    return LinearConstraint(np.vstack([A_pos, A_neg]), -np.inf, 0.0)
+
+
+def _budget_fluence_constraint(problem: BudgetProblem) -> NonlinearConstraint:
+    """F06b: hard cap ``int_0^T kappa^2 dt <= fluence_cap`` on the design curve.
+
+    Sine-series orthogonality (``basis.py`` module docstring) makes this an
+    exact quadratic form in ``a`` alone,
+    ``int_0^T kappa^2 dt = (T / 2) |a|^2``. ``basis.energy_invariant``/
+    ``_gradient``/``_hessian`` already implement this quadratic form, but as
+    the *scale-invariant* ``(int Omega^2 dt) * L`` with ``L = T`` -- i.e. they
+    return ``T`` times the physical fluence here, so this function divides
+    each of value/gradient/Hessian by *one* extra factor of ``T`` to recover
+    the physical quantity (``_dev_logs/F06b_task_brief.md`` §2: "那套是 T=1
+    无量纲量，按 §3.1 折算").
+
+    ★ Normalized by the cap itself (mirrors the energy-era ``Problem``'s
+    ``bandwidth`` ``extra_constraints`` kind in ``_extra_constraint_objects``):
+    the raw form has values of order 1-10 against a gate-residual block of
+    order ``1e-9`` and ``trust-constr`` weighs constraint violations
+    unscaled, so the constraint reads ``fluence / cap - 1 <= 0``, an ``O(1)``
+    quantity, without changing the feasible set.
+
+    Exact and constant Hessian in ``a`` -- no Gauss-Newton approximation
+    needed, and this is supplied regardless of :attr:`BudgetProblem.hessian_mode`
+    (that flag only governs the *nonlinear-in-the-propagator* blocks: the
+    gate residual and the peak cone, per those two functions' own
+    docstrings). ``c``, ``Phi_0``, ``phi_vz``, ``s`` and ``r`` do not enter
+    the fluence at all, so their columns/rows are exactly zero.
+    """
+    M, T, cap = problem.M, problem.T, float(problem.fluence_cap)
+    if cap <= 0.0:
+        raise ValueError(f"fluence_cap must be positive, got {cap}")
+    n = problem.n_vars
+    H_full = basis.energy_hessian(M, T) / (T * cap)
+    H = np.zeros((n, n))
+    H[:M, :M] = H_full
+
+    def value(x):
+        a = np.asarray(x[:M], dtype=float)
+        return np.array([basis.energy_invariant(a, T) / (T * cap) - 1.0])
+
+    def jacobian(x):
+        a = np.asarray(x[:M], dtype=float)
+        row = np.zeros((1, n))
+        row[0, :M] = basis.energy_gradient(a, T) / (T * cap)
+        return row
+
+    def hessian(x, v, _H=H):
+        return csr_matrix(float(v[0]) * _H)
+
+    return NonlinearConstraint(value, -np.inf, 0.0, jac=jacobian, hess=hessian)
+
+
+def budget_manifest_for(problem: BudgetProblem, *, early_stop: EarlyStop | None = None, **extra) -> dict:
+    """Build the manifest dict for a :class:`BudgetProblem`. Pure data.
+
+    Carries the *whole* device (``device.to_manifest()``) verbatim, per
+    ``_plan_full_cost.md`` §3.2's "整份 device 进每个 RunRecord 的 manifest".
+
+    ``layer`` is ``"general"``: :class:`BudgetProblem`'s design curve is
+    always the full ``(a, c, Phi_0)`` parametrization of
+    :mod:`curve_opt.parametrization` (:func:`curve_opt.budget.design_chain`
+    calls :func:`curve_opt.parametrization.design_curve` unconditionally, not
+    a ``c = 0``-restricted variant), so it is the same design-curve layer
+    :class:`Problem`'s general layer names, not a fourth thing. F05-pre
+    corrects this from the F04 placeholder ``"budget"`` -- no test asserted
+    on that value (module-scope search), and the recorder's
+    :data:`curve_opt.recorder.REQUIRED_MANIFEST_KEYS_BUDGET` now requires
+    ``layer`` to say which readout family the run used, not which objective.
+    ``novera_git_hash`` is F03's pinned upstream reference
+    (:data:`curve_opt.novera.UPSTREAM_GIT_HASH`), promised into the manifest
+    by that module's own docstring ("F04 wires it in") but not actually
+    wired until here.
+    """
+    man = {
+        "ansatz": dict(problem.ansatz or {}),
+        "M": problem.M,
+        "T": problem.T,
+        "target_gate": dict(problem.target_gate or {"name": "unspecified"}),
+        "N_grid": problem.N_grid,
+        "n_peak": problem.n_peak,
+        "layer": "general",
+        "gate_level": problem.gate_level,
+        "winding_branch": float(problem.theta),
+        "device": problem.device.to_manifest(),
+        "novera_git_hash": novera.UPSTREAM_GIT_HASH,
+        "tau_guard": {
+            "rho": float(problem.rho),
+            "bound": problem.tau_guard_bound,
+        },
+        "fluence_cap": (None if problem.fluence_cap is None else float(problem.fluence_cap)),
+        "e0_cap": (None if problem.e0_cap is None else float(problem.e0_cap)),
+        "objective": {
+            "mode": problem.objective_mode,
+            "terms": ["c1", "c2", "c3", "c4"],
+            "weights": dict(budget.weights_from_device(problem.device)._asdict()),
+        },
+        "solver": {
+            "method": "trust-constr",
+            "maxiter": problem.maxiter,
+            "fixed_budget_survey": bool(problem.fixed_budget_survey),
+            "hessian_mode": problem.hessian_mode,
+            "gtol": problem.gtol,
+            "xtol": problem.xtol,
+            "checkpoint_every": problem.checkpoint_every,
+            "early_stop": (None if early_stop is None else early_stop._asdict()),
+        },
+    }
+    man.update(extra)
+    return man
+
+
+def reevaluate_budget(
+    coeffs_a, coeffs_c, Phi_0: float, phi_vz: float, T: float,
+    device: Device = DEFAULT_DEVICE, grids=FINE_GRIDS, theta: float | None = None,
+    gate_level: str = "three_level",
+) -> dict:
+    """Re-evaluate the gate residual and budget terms on finer grids -- mandatory for a claim.
+
+    Only the parts that actually depend on the grid are re-run per grid
+    (the gate residual, at the given *gate_level*); the budget terms are
+    reported per grid too since C4/the design-curve integrals also carry an
+    ``O(dt^2)`` quadrature error.
+    """
+    a = np.asarray(coeffs_a, dtype=float)
+    c = np.asarray(coeffs_c, dtype=float)
+    U_target = propagate.target_x(np.pi if theta is None else theta)
+    out = {"layer": "budget", "gate_level": gate_level, "grids": {}}
+    for N in grids:
+        terms = budget.budget_terms(a, c, Phi_0, T, device, N)
+        om_x, om_y = budget.broadcast_waveform(a, c, Phi_0, T, device.delta, N)
+        if gate_level == "three_level":
+            U3 = gate.three_level_propagator(om_x, om_y, T, device.delta)
+            gate_res, _W, P = gate.polar_gate_residual(U3, U_target, phi_vz)
+            margin = float(gate.polar_margin(gate.qubit_block(U3)))
+        else:
+            chain2 = propagate.chain(om_x, om_y, T)
+            target = gate.rz(phi_vz) @ jnp.asarray(U_target, dtype=jnp.complex128)
+            gate_res = propagate.gate_residual(chain2.U_edge[-1], target)
+            margin = None
+        out["grids"][str(N)] = {
+            "c1": float(terms.c1),
+            "c2": float(terms.c2),
+            "c3": float(terms.c3),
+            "c4": float(terms.c4),
+            "total": float(terms.total),
+            "gate_residual_max": float(np.max(np.abs(np.asarray(gate_res)))),
+            "polar_margin": margin,
+            "peak_phys": float(np.max(np.hypot(np.asarray(om_x), np.asarray(om_y)))),
+        }
+    return out
+
+
+def solve_budget(
+    problem: BudgetProblem,
+    *,
+    recorder=None,
+    early_stop: EarlyStop | None = None,
+    fine_grids=FINE_GRIDS,
+    verbose: int = 0,
+) -> BudgetSolveResult:
+    """Run one F04 budget-mode optimization: min C1+C2+C3+C4 s.t. G, P, peak, R guard.
+
+    Mirrors :func:`solve`'s shape (assemble scipy objects, call trust-constr,
+    checkpoint through *recorder* if given -- see the module-level "F04"
+    section docstring for why recorder integration is a no-op today unless
+    the caller supplies one with a compatible ``append``/``close``) but is
+    otherwise a fresh implementation: the free-parameter set, constraint set
+    and objective are all different from :func:`solve`'s (section docstring).
+
+    F05b adds :func:`_budget_tau_guard_constraint` (the R guard,
+    ``_plan_full_cost.md`` §5.4) to the constraint set unconditionally --
+    every ``general``-layer solve now carries it, not only ones that opt in,
+    per the task brief's "F06 开工前必须给 BudgetProblem 加硬不等式".
+    """
+    if problem.hessian_mode not in HESSIAN_MODES:
+        raise ValueError(f"hessian_mode must be one of {HESSIAN_MODES}")
+    if problem.gate_level not in GATE_LEVELS:
+        raise ValueError(f"gate_level must be one of {GATE_LEVELS}, got {problem.gate_level!r}")
+    if problem.objective_mode not in OBJECTIVE_MODES:
+        raise ValueError(
+            f"objective_mode must be one of {OBJECTIVE_MODES}, got {problem.objective_mode!r}"
+        )
+
+    x0 = _budget_x0(problem)
+    bounds = _budget_bounds(problem)
+    if problem.objective_mode == "ad_exact":
+        fun, jac, hess = _budget_objective_ad(problem)
+    elif problem.objective_mode == "ad_robust":
+        fun, jac, hess = _budget_objective_ad_robust(problem)
+    else:
+        fun, jac, hess = _budget_objective(problem)
+    constraints = [
+        _budget_gate_constraint(problem),
+        _budget_c1_constraint(problem),
+        _budget_peak_constraint(problem),
+        _budget_tau_guard_constraint(problem),
+    ]
+    if problem.fluence_cap is not None:
+        constraints.append(_budget_fluence_constraint(problem))
+    if problem.e0_cap is not None:
+        constraints.append(_budget_e0_constraint(problem))
+
+    objective_kwargs = (
+        {"jac": jac, "hess": hess}
+        if hess is not None and problem.hessian_mode in ("gauss_newton", "objective_only")
+        else {"jac": jac, "hess": BFGS()}
+    )
+
+    U_target = propagate.target_x(problem.theta)
+
+    def evaluate(x):
+        a, c, Phi_0, phi_vz, s, _r = _split_budget(problem, x)
+        terms = budget.budget_terms(a, c, Phi_0, problem.T, problem.device, problem.N_grid)
+        om_x, om_y = budget.broadcast_waveform(
+            a, c, Phi_0, problem.T, problem.device.delta, problem.N_grid
+        )
+        if problem.gate_level == "three_level":
+            U3 = gate.three_level_propagator(om_x, om_y, problem.T, problem.device.delta)
+            gate_res, _W, _P = gate.polar_gate_residual(U3, U_target, phi_vz)
+            margin = float(gate.polar_margin(gate.qubit_block(U3)))
+        else:
+            chain2 = propagate.chain(om_x, om_y, problem.T)
+            target = gate.rz(phi_vz) @ jnp.asarray(U_target, dtype=jnp.complex128)
+            gate_res = propagate.gate_residual(chain2.U_edge[-1], target)
+            margin = None
+        c1_res = np.array(
+            [
+                float(basis.c1_row(problem.M, problem.T, "start") @ np.asarray(a)),
+                float(basis.c1_row(problem.M, problem.T, "end") @ np.asarray(a)),
+            ]
+        )
+        return terms, np.asarray(gate_res), c1_res, margin
+
+    state = {"n": 0, "checkpoints": 0, "stalled": 0, "prev": None, "early": False}
+
+    def callback(xk, res=None):
+        state["n"] += 1
+        terms, gate_res, c1_res, _margin = evaluate(xk)
+        total = float(terms.total)
+
+        if recorder is not None and (state["n"] - 1) % problem.checkpoint_every == 0:
+            a, c, Phi_0, phi_vz, s, _r = _split_budget(problem, xk)
+            recorder.append_budget(
+                state["n"] - 1,
+                np.asarray(a),
+                np.asarray(c),
+                cost_total=total,
+                cost_c1=float(terms.c1),
+                cost_c2=float(terms.c2),
+                cost_c3=float(terms.c3),
+                cost_c4=float(terms.c4),
+                Phi_0=float(Phi_0),
+                phi_vz=float(phi_vz),
+                res_gate=np.asarray(gate_res),
+                res_c1_ends=c1_res,
+                epigraph_s=float(s),
+            )
+            state["checkpoints"] += 1
+
+        if early_stop is not None:
+            prev = state["prev"]
+            if prev is not None:
+                improvement = abs(prev - total) / max(abs(prev), 1e-300)
+                state["stalled"] = state["stalled"] + 1 if improvement < early_stop.tol else 0
+            state["prev"] = total
+            if state["stalled"] >= early_stop.patience:
+                state["early"] = True
+                return True
+        return False
+
+    t_start = time.perf_counter()
+    res = minimize(
+        fun,
+        x0,
+        method="trust-constr",
+        bounds=bounds,
+        constraints=constraints,
+        callback=callback,
+        options={
+            "maxiter": problem.maxiter,
+            "gtol": problem.gtol,
+            "xtol": problem.xtol,
+            "verbose": verbose,
+        },
+        **objective_kwargs,
+    )
+    wall = time.perf_counter() - t_start
+
+    if state["early"]:
+        stop_reason = "early_stop"
+    elif res.status in (1, 2):
+        stop_reason = "converged"
+    elif res.nit >= problem.maxiter or res.status == 0:
+        stop_reason = "maxiter"
+    else:
+        stop_reason = "failed"
+
+    a, c, Phi_0, phi_vz, s, r = _split_budget(problem, res.x)
+    terms, gate_res, c1_res, margin = evaluate(res.x)
+    # ★ same grid the peak epigraph constraint was built on (n_peak, not
+    # N_grid): metrics.peak's docstring documents why this must match --
+    # the constrained grid's maximum under-reports the continuum maximum by
+    # O(dt^2), so reporting on a *finer* grid than the constraint used can
+    # show an apparent (grid-resolution, not physical) overshoot of Omega_max.
+    om_x_peak, om_y_peak = budget.broadcast_waveform(
+        a, c, Phi_0, problem.T, problem.device.delta, problem.n_peak
+    )
+    peak_phys = float(np.max(np.hypot(np.asarray(om_x_peak), np.asarray(om_y_peak))))
+    # ★ F05b: same grid rationale as peak_phys above, applied to tau -- the
+    # raw slack r is not necessarily tight (docstring of BudgetSolveResult.r),
+    # so tau_peak is measured directly from the solved c, independently of r.
+    tau_final = np.asarray(parametrization.tau_of_coeffs(c, problem.T, problem.n_peak))
+    tau_peak = float(np.max(np.abs(tau_final))) if tau_final.size else 0.0
+
+    out = BudgetSolveResult(
+        coeffs_a=np.asarray(a),
+        coeffs_c=np.asarray(c),
+        Phi_0=float(Phi_0),
+        phi_vz=float(phi_vz),
+        s=float(s),
+        r=float(r),
+        stop_reason=stop_reason,
+        status=int(res.status),
+        nit=int(res.nit),
+        wall_clock_s=wall,
+        terms=terms,
+        gate_residual=gate_res,
+        c1_residual=c1_res,
+        peak_phys=peak_phys,
+        tau_peak=tau_peak,
+        polar_margin=margin,
+        scipy_message=str(res.message),
+        fixed_budget_survey=bool(problem.fixed_budget_survey),
+    )
+
+    if recorder is not None:
+        recorder.close(
+            status=stop_reason,
+            nit=out.nit,
+            wall_clock_s=wall,
+            scipy_status=out.status,
+            scipy_message=out.scipy_message,
+            gate_residual=out.gate_residual.tolist(),
+            c1_residual=out.c1_residual.tolist(),
+            peak_phys=out.peak_phys,
+            tau_peak=out.tau_peak,
+            polar_margin=out.polar_margin,
             terms=out.terms._asdict(),
             void_for_claims=out.void_for_claims,
         )

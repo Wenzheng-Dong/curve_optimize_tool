@@ -270,6 +270,138 @@ def test_every_propagator_is_unitary(N):
     assert np.allclose(np.linalg.norm(np.asarray(c.tangent), axis=1), 1.0, atol=1e-13)
 
 
+# --------------------------------------------------------------------------
+# F01b: U_mid ordering regression (independent arbiter)
+# --------------------------------------------------------------------------
+#
+# test_every_propagator_is_unitary above only checks unitarity, which cannot
+# see a multiplication-order error at all (U_1 U_2 is exactly as unitary as
+# U_2 U_1 for unitary U_1, U_2) -- that is precisely how chain()'s U_mid
+# carried a reversed-order bug from Step 11 through F01 without being caught.
+# This section is the U_mid analogue of the admission gate at the top of the
+# file: a genuinely non-commuting smooth control, checked against an
+# *independent* reference (an ordered scipy.linalg.expm product on a much
+# finer grid -- no call into curve_opt.propagate), with a "wrong order"
+# negative control that must fail the same check (_dev_logs/F01b_umid_order.md).
+
+
+class _UMidReference:
+    """Ordered scipy.linalg.expm product on a fine grid, built once per module.
+
+    ``N_ref`` is an exact multiple of every coarse ``N`` used below, and
+    ``refine = N_ref / N`` is large enough that the reference's own local
+    truncation error (O((dt / refine)^2)) is negligible next to the coarse
+    scheme's O(dt^2) error being measured -- not exact, but three-plus orders
+    of magnitude finer than anything compared against it.
+    """
+
+    def __init__(self, a, b, T_total: float, N_ref: int):
+        self.a, self.b, self.T = a, b, T_total
+        self.N_ref = N_ref
+        dt_ref = T_total / N_ref
+        t_mid = (np.arange(N_ref) + 0.5) * dt_ref
+        om_x = basis.omega(a, t_mid, T_total)
+        om_y = basis.omega(b, t_mid, T_total)
+        U = np.eye(2, dtype=complex)
+        edges = np.empty((N_ref, 2, 2), dtype=complex)
+        for i in range(N_ref):
+            step = expm(-1j * dt_ref * 0.5 * (om_x[i] * SX + om_y[i] * SY))
+            U = step @ U
+            edges[i] = U
+        self.edges = edges
+
+    def at_midpoint(self, k: int, N_coarse: int):
+        """``U(t)`` at the coarse cell-``k`` midpoint, ``t = (k + 0.5) T / N_coarse``."""
+        refine = self.N_ref // N_coarse
+        assert refine * N_coarse == self.N_ref and refine % 2 == 0
+        j = k * refine + refine // 2  # 1-indexed count of fine cells reaching t
+        return self.edges[j - 1]
+
+
+@pytest.fixture(scope="module")
+def umid_reference():
+    """Built once (~7 s of scipy.linalg.expm calls), shared by the tests below."""
+    M = 5
+    a = rng(70).normal(size=M) * 3.0
+    b = rng(71).normal(size=M) * 2.0
+    assert propagate.noncommutativity(a, b, T, 2000) > 1.0  # genuinely non-planar
+    return _UMidReference(a, b, T, N_ref=32 * 8000)
+
+
+def _loglog_order(Ns, errs) -> float:
+    """Least-squares log-log slope of *errs* vs *Ns*, as a positive order (err ~ N^-p)."""
+    log_n = np.log(np.asarray(Ns, dtype=float))
+    log_e = np.log(np.asarray(errs, dtype=float))
+    slope, _ = np.polyfit(log_n, log_e, 1)
+    return float(-slope)
+
+
+def test_u_mid_converges_at_second_order_on_a_noncommuting_case(umid_reference):
+    """★ F01b criterion (1): U_mid itself, not just U_edge[-1], must be O(dt^2)."""
+    ref = umid_reference
+    Ns = (1000, 2000, 4000, 8000)
+    errs = []
+    for N in Ns:
+        c = propagate.chain(*propagate.omega_samples(ref.a, ref.b, T, N), T)
+        k = N // 2
+        errs.append(float(np.max(np.abs(np.asarray(c.U_mid[k]) - ref.at_midpoint(k, N)))))
+    order = _loglog_order(Ns, errs)
+    assert order == pytest.approx(2.0, abs=0.15), (Ns, errs, order)
+
+
+def test_the_wrong_u_mid_order_only_achieves_first_order(umid_reference):
+    """★ Negative control: ``U_left @ half`` (the pre-F01b bug) is O(dt), not O(dt^2).
+
+    Without this, a future regression to the reversed order would pass every
+    other test in this file (they all check ``U_edge`` or unitarity), exactly
+    as it did from Step 11 through F01 -- this is the test that would have
+    caught it.
+    """
+    ref = umid_reference
+    Ns = (1000, 2000, 4000, 8000)
+    errs = []
+    for N in Ns:
+        om_x, om_y = (jnp.asarray(x) for x in propagate.omega_samples(ref.a, ref.b, T, N))
+        dt = T / N
+        steps = propagate._cell_propagators(om_x, om_y, dt, 1.0)
+        U_edge = jax.lax.associative_scan(lambda A, B: B @ A, steps)
+        U_left = jnp.concatenate([jnp.eye(2, dtype=jnp.complex128)[None], U_edge[:-1]])
+        half = propagate._cell_propagators(om_x, om_y, dt, 0.5)
+        U_mid_wrong = U_left @ half  # the bug: reversed multiplication order
+        k = N // 2
+        errs.append(float(np.max(np.abs(np.asarray(U_mid_wrong[k]) - ref.at_midpoint(k, N)))))
+    order = _loglog_order(Ns, errs)
+    assert order == pytest.approx(1.0, abs=0.15), (Ns, errs, order)
+
+
+def test_closure_and_area_converge_at_second_order_on_a_noncommuting_case():
+    """★ F01b criterion (3): the downstream victims of the U_mid bug recover O(dt^2).
+
+    Self-referential reference (a much finer N of the same functions), matching
+    this file's existing style (``test_convergence_is_second_order_in_the_grid``
+    above) -- the independent arbiter for ``U_mid`` itself is the two tests
+    above, so this one only needs to confirm ``closure()``/``area()`` correctly
+    inherit the fix.
+    """
+    M = 5
+    a, b = rng(72).normal(size=M) * 3.0, rng(73).normal(size=M) * 2.0
+    assert propagate.noncommutativity(a, b, T, 2000) > 1.0
+
+    closure_ref = np.asarray(propagate.closure(a, b, T, 200_000))
+    area_ref = np.asarray(propagate.area(a, b, T, 200_000))
+    Ns = (1000, 2000, 4000, 8000)
+    closure_errs = [
+        float(np.linalg.norm(np.asarray(propagate.closure(a, b, T, N)) - closure_ref)) for N in Ns
+    ]
+    area_errs = [
+        float(np.linalg.norm(np.asarray(propagate.area(a, b, T, N)) - area_ref)) for N in Ns
+    ]
+    closure_order = _loglog_order(Ns, closure_errs)
+    area_order = _loglog_order(Ns, area_errs)
+    assert closure_order == pytest.approx(2.0, abs=0.15), (Ns, closure_errs, closure_order)
+    assert area_order == pytest.approx(2.0, abs=0.15), (Ns, area_errs, area_order)
+
+
 def test_zero_field_gives_the_identity_and_a_straight_line():
     N = 100
     zero = np.zeros(N)

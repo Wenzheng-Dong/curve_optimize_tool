@@ -10,12 +10,22 @@ import curve_opt
 
 
 def test_module_list_matches_the_plan():
+    """``_plan.md`` §4.1 plus F01's ``device`` (``_plan_full_cost.md`` §4.4),
+    the lowest-level dependency, ahead of ``basis``; F02-F04 add
+    ``parametrization``/``novera``/``gate``/``budget`` ahead of ``optimize``,
+    which depends on all four (``_plan_full_cost.md`` §4.4).
+    """
     assert curve_opt.MODULES == (
+        "device",
         "basis",
         "geometry",
         "propagate",
         "metrics",
         "ansatz",
+        "parametrization",
+        "novera",
+        "gate",
+        "budget",
         "optimize",
         "recorder",
         "plotting",
