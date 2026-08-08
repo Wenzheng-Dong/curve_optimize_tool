@@ -833,6 +833,7 @@ def solve(
 # ``self.schema``), rather than silently writing the wrong columns.
 
 GATE_LEVELS = ("three_level", "two_level")
+OBJECTIVE_MODES = ("budget", "ad_exact", "ad_robust")
 
 
 class BudgetProblem(NamedTuple):
@@ -906,6 +907,17 @@ class BudgetProblem(NamedTuple):
     :attr:`hessian_mode` (mirrors the energy-era ``Problem``'s ``bandwidth``
     ``extra_constraints`` kind, ``_nonlinear_constraint``'s sibling function
     `_extra_constraint_objects`)."""
+    e0_cap: float | None = None
+    """F06f hard cap on the zero-noise infidelity: ``infid(x, 0, 0) <= e0_cap``
+    (``_dev_logs/F06f_task_brief.md`` §2). ``None`` (default) disables the
+    constraint, reproducing every pre-F06f run bit-for-bit. Only meaningful
+    together with ``objective_mode="ad_robust"``, whose objective drops the
+    zero-noise term entirely (see that mode's docstring below) -- without a
+    cap nothing would stop the solver from trading away e0 for sensitivity.
+    A *positive-margin* inequality (the constraint function is nonzero, with
+    nonzero gradient, everywhere on its active boundary), not the scalar
+    ``1-Fbar=0`` equality the numerical red lines forbid: same status as the
+    fluence cap and the R guard, not the gate."""
     hessian_mode: str = "gauss_newton"
     maxiter: int = 3000
     fixed_budget_survey: bool = False
@@ -923,9 +935,15 @@ class BudgetProblem(NamedTuple):
     :func:`curve_opt.gate.three_level_propagator` by forward-mode AD. Exact
     by construction at first order in each noise channel -- no design-curve
     surrogate, hence immune to the tau != 0 readout-map truncation the F06d
-    screening located (the C3/C4 formulas stay reporting quantities). The
-    hard-constraint set (gate / c1 / peak / R guard / fluence cap) is
-    identical in both modes."""
+    screening located (the C3/C4 formulas stay reporting quantities).
+    ``"ad_robust"`` (F06f): the same second-order expansion with the
+    zero-noise term ``(1-Fbar)(0,0)`` dropped, ``J_rob = (1/2)<delta_z^2>
+    d2/d(delta_z)^2 (1-Fbar) + (1/2)<eps^2> d2/d(eps)^2 (1-Fbar)`` --
+    minimizing *sensitivity* alone rather than a weighted sum that lets the
+    zero-noise term dominate. Pairs with :attr:`e0_cap` as a hard fuse so
+    leakage cannot silently regrow while the objective no longer prices it.
+    The hard-constraint set (gate / c1 / peak / R guard / fluence cap /
+    e0 cap) is identical across all three modes."""
 
     @property
     def n_coeffs(self) -> int:
@@ -1108,21 +1126,23 @@ def _block_avg_infidelity(B, target):
     return 1.0 - (tot + 4.0) / 12.0
 
 
-def _budget_objective_ad(problem: BudgetProblem):
-    """F06e ``objective_mode="ad_exact"``: true-model expected infidelity to O(noise^2).
+def _d2_at_zero(f, x):
+    """``d^2/du^2 f(x, u)|_{u=0}`` via forward-over-forward JVP (jvp of a jvp)."""
+    def first(v):
+        return jax.jvp(lambda u: f(x, u), (v,), (1.0,))[1]
+    return jax.jvp(first, (0.0,), (1.0,))[1]
 
-    ``J(x) = infid(0,0) + (1/2)<dz^2> d2_dz infid + (1/2)<eps^2> d2_eps infid``
-    with ``infid(dz, eps)`` the three-level block infidelity of the broadcast
-    waveform under quasi-static Z noise ``dz`` and amplitude scaling
-    ``(1+eps)``, at the (optimized, frozen-per-evaluation) ``phi_vz``. The
-    second derivatives are forward-over-forward JVPs; the parameter gradient
-    is one reverse pass over the whole expression. No Gauss-Newton structure
-    exists here, so the solver runs BFGS on the objective (the constraint
-    blocks keep their own exact/GN Hessians unchanged).
 
-    Noise moments come from :func:`curve_opt.budget.weights_from_device` so
-    the two modes share one unit convention: ``w1 = <dz^2>/6`` and
-    ``w3 = (2/3)<eps^2>`` (tex Eq. (budget)).
+def _budget_infid_closure(problem: BudgetProblem):
+    """Shared ``infid(x, dz, eps)`` closure and noise moments for the ``ad_exact``/
+    ``ad_robust`` objectives and the :attr:`BudgetProblem.e0_cap` guard.
+
+    ``infid`` is the three-level block infidelity of the broadcast waveform
+    under quasi-static Z noise ``dz`` and amplitude scaling ``(1+eps)``, at
+    the (optimized, frozen-per-evaluation) ``phi_vz`` -- see
+    :func:`_budget_objective_ad`'s docstring for the physics. Noise moments
+    come from :func:`curve_opt.budget.weights_from_device`: ``w1 = <dz^2>/6``
+    and ``w3 = (2/3)<eps^2>`` (tex Eq. (budget)).
     """
     T, N, device = problem.T, problem.N_grid, problem.device
     U_t = jnp.asarray(propagate.target_x(problem.theta), dtype=jnp.complex128)
@@ -1138,10 +1158,19 @@ def _budget_objective_ad(problem: BudgetProblem):
         )
         return _block_avg_infidelity(gate.qubit_block(U3), gate.rz(phi_vz) @ U_t)
 
-    def _d2_at_zero(f, x):
-        def first(v):
-            return jax.jvp(lambda u: f(x, u), (v,), (1.0,))[1]
-        return jax.jvp(first, (0.0,), (1.0,))[1]
+    return infid, var_dz, var_eps
+
+
+def _budget_objective_ad(problem: BudgetProblem):
+    """F06e ``objective_mode="ad_exact"``: true-model expected infidelity to O(noise^2).
+
+    ``J(x) = infid(0,0) + (1/2)<dz^2> d2_dz infid + (1/2)<eps^2> d2_eps infid``.
+    The second derivatives are forward-over-forward JVPs; the parameter
+    gradient is one reverse pass over the whole expression. No Gauss-Newton
+    structure exists here, so the solver runs BFGS on the objective (the
+    constraint blocks keep their own exact/GN Hessians unchanged).
+    """
+    infid, var_dz, var_eps = _budget_infid_closure(problem)
 
     def total(x):
         return (
@@ -1160,6 +1189,64 @@ def _budget_objective_ad(problem: BudgetProblem):
         return np.asarray(jac_j(jnp.asarray(x, dtype=float)))
 
     return fun, jac, None
+
+
+def _budget_objective_ad_robust(problem: BudgetProblem):
+    """F06f ``objective_mode="ad_robust"``: sensitivity alone, zero-noise term dropped.
+
+    ``J_rob(x) = (1/2)<dz^2> d2_dz infid + (1/2)<eps^2> d2_eps infid`` -- the
+    same closure and second-order JVPs :func:`_budget_objective_ad` uses,
+    minus the ``infid(x, 0, 0)`` term. The zero-noise level is left to
+    :attr:`BudgetProblem.e0_cap` (a hard fuse, not a soft price) rather than
+    the objective, per the task brief's diagnosis that mixing the two into
+    one weighted sum let the zero-noise term dominate the tradeoff.
+    """
+    infid, var_dz, var_eps = _budget_infid_closure(problem)
+
+    def total(x):
+        return (
+            0.5 * var_dz * _d2_at_zero(lambda xx, u: infid(xx, u, 0.0), x)
+            + 0.5 * var_eps * _d2_at_zero(lambda xx, u: infid(xx, 0.0, u), x)
+        )
+
+    fun_j = jax.jit(total)
+    jac_j = jax.jit(jax.grad(total))
+
+    def fun(x):
+        return float(fun_j(jnp.asarray(x, dtype=float)))
+
+    def jac(x):
+        return np.asarray(jac_j(jnp.asarray(x, dtype=float)))
+
+    return fun, jac, None
+
+
+def _budget_e0_constraint(problem: BudgetProblem) -> NonlinearConstraint:
+    """F06f fuse: ``infid(x, 0, 0) <= e0_cap``, reverse-AD gradient, BFGS Hessian.
+
+    A positive-margin inequality on the *same* zero-noise infidelity
+    :func:`_budget_objective_ad`'s first term names -- its gradient does not
+    vanish generically on the active boundary (unlike the scalar ``1-Fbar=0``
+    equality the numerical red lines forbid: that residual's gradient *does*
+    vanish at its own zero, which is the whole reason it is banned as a hard
+    constraint). Built only when :attr:`BudgetProblem.e0_cap` is not ``None``.
+    """
+    cap = float(problem.e0_cap)
+    infid, _var_dz, _var_eps = _budget_infid_closure(problem)
+
+    def value(x):
+        return jnp.reshape(infid(x, 0.0, 0.0), (1,))
+
+    fun_j = jax.jit(value)
+    jac_j = jax.jit(jax.jacrev(value))
+
+    return NonlinearConstraint(
+        lambda x: np.asarray(fun_j(jnp.asarray(x, dtype=float))),
+        -np.inf,
+        cap,
+        jac=lambda x: np.asarray(jac_j(jnp.asarray(x, dtype=float))),
+        hess=BFGS(),
+    )
 
 
 def _budget_gate_constraint(problem: BudgetProblem):
@@ -1410,6 +1497,7 @@ def budget_manifest_for(problem: BudgetProblem, *, early_stop: EarlyStop | None 
             "bound": problem.tau_guard_bound,
         },
         "fluence_cap": (None if problem.fluence_cap is None else float(problem.fluence_cap)),
+        "e0_cap": (None if problem.e0_cap is None else float(problem.e0_cap)),
         "objective": {
             "mode": problem.objective_mode,
             "terms": ["c1", "c2", "c3", "c4"],
@@ -1497,11 +1585,17 @@ def solve_budget(
         raise ValueError(f"hessian_mode must be one of {HESSIAN_MODES}")
     if problem.gate_level not in GATE_LEVELS:
         raise ValueError(f"gate_level must be one of {GATE_LEVELS}, got {problem.gate_level!r}")
+    if problem.objective_mode not in OBJECTIVE_MODES:
+        raise ValueError(
+            f"objective_mode must be one of {OBJECTIVE_MODES}, got {problem.objective_mode!r}"
+        )
 
     x0 = _budget_x0(problem)
     bounds = _budget_bounds(problem)
     if problem.objective_mode == "ad_exact":
         fun, jac, hess = _budget_objective_ad(problem)
+    elif problem.objective_mode == "ad_robust":
+        fun, jac, hess = _budget_objective_ad_robust(problem)
     else:
         fun, jac, hess = _budget_objective(problem)
     constraints = [
@@ -1512,6 +1606,8 @@ def solve_budget(
     ]
     if problem.fluence_cap is not None:
         constraints.append(_budget_fluence_constraint(problem))
+    if problem.e0_cap is not None:
+        constraints.append(_budget_e0_constraint(problem))
 
     objective_kwargs = (
         {"jac": jac, "hess": hess}
