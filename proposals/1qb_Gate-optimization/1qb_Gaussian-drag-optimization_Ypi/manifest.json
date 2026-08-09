@@ -1,0 +1,84 @@
+{
+ "git_commit": "06ea35699340e2cfe7be18c7021606ef916f5d9a",
+ "N_export": 120,
+ "T_ns": 50.0,
+ "gate": {
+  "key": "Ypi",
+  "name": "Y(pi)",
+  "theta": 3.141592653589793,
+  "phi_axis": 1.5707963267948966,
+  "solve_mode": "rotate_from_x",
+  "source_gate": "Xpi",
+  "fluence_floor": 0.19739208802178715
+ },
+ "device": {
+  "anharmonicity": -0.2,
+  "rabi_max": 0.05,
+  "gate_time": 50.0,
+  "n_modes": 20,
+  "static_detuning": 0.0001,
+  "control_error": 0.02
+ },
+ "arms": {
+  "A": {
+   "name": "Gaussian",
+   "layer": "planar",
+   "csv": "waveforms/A_gaussian_120pt.csv",
+   "json": "waveforms/A_gaussian.json",
+   "run_id": null,
+   "infidelity_120pt": 0.0017185320709343088,
+   "infidelity_fine": 0.0017185331283666727,
+   "sampling_loss_ratio": 0.9999993846889847
+  },
+  "B": {
+   "name": "Gaussian + DRAG",
+   "layer": "planar_drag",
+   "csv": "waveforms/B_gaussian_drag_120pt.csv",
+   "json": "waveforms/B_gaussian_drag.json",
+   "run_id": null,
+   "infidelity_120pt": 7.229761350591168e-06,
+   "infidelity_fine": 7.231667204177228e-06,
+   "sampling_loss_ratio": 0.9997364572328552
+  },
+  "C": {
+   "name": "Optimized (3D)",
+   "layer": "general",
+   "csv": "waveforms/C_optimized_120pt.csv",
+   "json": "waveforms/C_optimized.json",
+   "run_id": "20260808_F06min_gaussian3d_construction",
+   "infidelity_120pt": 0.00017645114850628474,
+   "infidelity_fine": 0.00018086139869633033,
+   "sampling_loss_ratio": 0.9756153041951727
+  },
+  "D": {
+   "name": "Opt + fluence cap",
+   "layer": "general",
+   "csv": "waveforms/D_optimized_fluence_cap_120pt.csv",
+   "json": "waveforms/D_optimized_fluence_cap.json",
+   "run_id": "20260810_F06b_fluence_cap2_mi20000",
+   "infidelity_120pt": 8.7271337244621e-06,
+   "infidelity_fine": 9.008817183353557e-06,
+   "sampling_loss_ratio": 0.968732470294552
+  },
+  "E": {
+   "name": "Opt AD-exact",
+   "layer": "general",
+   "csv": "waveforms/E_optimized_ad_exact_120pt.csv",
+   "json": "waveforms/E_optimized_ad_exact.json",
+   "run_id": "20260810_F06e_adexact_construction_r2",
+   "infidelity_120pt": 4.861189729643556e-07,
+   "infidelity_fine": 3.310604990147681e-08,
+   "sampling_loss_ratio": 14.683689972408052
+  },
+  "F": {
+   "name": "Opt AD-robust",
+   "layer": "general",
+   "csv": "waveforms/F_optimized_ad_robust_120pt.csv",
+   "json": "waveforms/F_optimized_ad_robust.json",
+   "run_id": "20260808_F06f_adrobust_construction",
+   "infidelity_120pt": 6.017629899601751e-06,
+   "infidelity_fine": 5.354252863298825e-06,
+   "sampling_loss_ratio": 1.1238972183869198
+  }
+ }
+}

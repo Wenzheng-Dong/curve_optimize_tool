@@ -34,7 +34,7 @@ venv/
 .claude/worktrees/
 
 # stray scratch dir, not part of this repo
-proposals/
+#proposals/
 
 # LaTeX build artifacts (manuscripts under _self_study/_write-up/)
 *.aux

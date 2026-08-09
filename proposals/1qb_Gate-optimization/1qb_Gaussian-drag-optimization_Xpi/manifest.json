@@ -1,0 +1,84 @@
+{
+ "git_commit": "06ea35699340e2cfe7be18c7021606ef916f5d9a",
+ "N_export": 120,
+ "T_ns": 50.0,
+ "gate": {
+  "key": "Xpi",
+  "name": "X(pi)",
+  "theta": 3.141592653589793,
+  "phi_axis": 0.0,
+  "solve_mode": "independent",
+  "source_gate": null,
+  "fluence_floor": 0.19739208802178715
+ },
+ "device": {
+  "anharmonicity": -0.2,
+  "rabi_max": 0.05,
+  "gate_time": 50.0,
+  "n_modes": 20,
+  "static_detuning": 0.0001,
+  "control_error": 0.02
+ },
+ "arms": {
+  "A": {
+   "name": "Gaussian",
+   "layer": "planar",
+   "csv": "waveforms/A_gaussian_120pt.csv",
+   "json": "waveforms/A_gaussian.json",
+   "run_id": null,
+   "infidelity_120pt": 0.0017185320709346419,
+   "infidelity_fine": 0.0017185331283652294,
+   "sampling_loss_ratio": 0.9999993846900185
+  },
+  "B": {
+   "name": "Gaussian + DRAG",
+   "layer": "planar_drag",
+   "csv": "waveforms/B_gaussian_drag_120pt.csv",
+   "json": "waveforms/B_gaussian_drag.json",
+   "run_id": null,
+   "infidelity_120pt": 7.229761351257302e-06,
+   "infidelity_fine": 7.231667209062209e-06,
+   "sampling_loss_ratio": 0.999736456649648
+  },
+  "C": {
+   "name": "Optimized (3D)",
+   "layer": "general",
+   "csv": "waveforms/C_optimized_120pt.csv",
+   "json": "waveforms/C_optimized.json",
+   "run_id": "20260808_F06min_gaussian3d_construction",
+   "infidelity_120pt": 0.0001764511485046194,
+   "infidelity_fine": 0.00018086139869277762,
+   "sampling_loss_ratio": 0.9756153042051292
+  },
+  "D": {
+   "name": "Opt + fluence cap",
+   "layer": "general",
+   "csv": "waveforms/D_optimized_fluence_cap_120pt.csv",
+   "json": "waveforms/D_optimized_fluence_cap.json",
+   "run_id": "20260810_F06b_fluence_cap2_mi20000",
+   "infidelity_120pt": 8.727133724573122e-06,
+   "infidelity_fine": 9.008817186462181e-06,
+   "sampling_loss_ratio": 0.9687324699726004
+  },
+  "E": {
+   "name": "Opt AD-exact",
+   "layer": "general",
+   "csv": "waveforms/E_optimized_ad_exact_120pt.csv",
+   "json": "waveforms/E_optimized_ad_exact.json",
+   "run_id": "20260810_F06e_adexact_construction_r2",
+   "infidelity_120pt": 4.861189711879987e-07,
+   "infidelity_fine": 3.310605090067753e-08,
+   "sampling_loss_ratio": 14.683689475571068
+  },
+  "F": {
+   "name": "Opt AD-robust",
+   "layer": "general",
+   "csv": "waveforms/F_optimized_ad_robust_120pt.csv",
+   "json": "waveforms/F_optimized_ad_robust.json",
+   "run_id": "20260808_F06f_adrobust_construction",
+   "infidelity_120pt": 6.0176299042646875e-06,
+   "infidelity_fine": 5.354252867739717e-06,
+   "sampling_loss_ratio": 1.1238972183256286
+  }
+ }
+}

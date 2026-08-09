@@ -1,0 +1,64 @@
+{
+ "git_commit": "06ea35699340e2cfe7be18c7021606ef916f5d9a",
+ "N_export": 120,
+ "T_ns": 50.0,
+ "gate": {
+  "key": "Xpi2",
+  "name": "X(pi/2)",
+  "theta": 1.5707963267948966,
+  "phi_axis": 0.0,
+  "solve_mode": "independent",
+  "source_gate": null,
+  "fluence_floor": 0.04934802200544679
+ },
+ "device": {
+  "anharmonicity": -0.2,
+  "rabi_max": 0.05,
+  "gate_time": 50.0,
+  "n_modes": 20,
+  "static_detuning": 0.0001,
+  "control_error": 0.02
+ },
+ "arms": {
+  "A": {
+   "name": "Gaussian",
+   "layer": "planar",
+   "csv": "waveforms/A_gaussian_120pt.csv",
+   "json": "waveforms/A_gaussian.json",
+   "run_id": null,
+   "infidelity_120pt": 8.454040022110032e-05,
+   "infidelity_fine": 8.454081754483145e-05,
+   "sampling_loss_ratio": 0.999995063642117
+  },
+  "B": {
+   "name": "Gaussian + DRAG",
+   "layer": "planar_drag",
+   "csv": "waveforms/B_gaussian_drag_120pt.csv",
+   "json": "waveforms/B_gaussian_drag.json",
+   "run_id": null,
+   "infidelity_120pt": 1.1361220642047698e-07,
+   "infidelity_fine": 1.1370134611610183e-07,
+   "sampling_loss_ratio": 0.9992160189947634
+  },
+  "C": {
+   "name": "Optimized (3D)",
+   "layer": "general",
+   "csv": "waveforms/C_optimized_120pt.csv",
+   "json": "waveforms/C_optimized.json",
+   "run_id": "20260808_Xpi2_armC",
+   "infidelity_120pt": 7.868454963011473e-05,
+   "infidelity_fine": 7.954380720942567e-05,
+   "sampling_loss_ratio": 0.9891976810080432
+  },
+  "D": {
+   "name": "Opt + fluence cap",
+   "layer": "general",
+   "csv": "waveforms/D_optimized_fluence_cap_120pt.csv",
+   "json": "waveforms/D_optimized_fluence_cap.json",
+   "run_id": "20260808_Xpi2_armD",
+   "infidelity_120pt": 2.295040790745162e-08,
+   "infidelity_fine": 3.982327689833198e-09,
+   "sampling_loss_ratio": 5.763063638897307
+  }
+ }
+}

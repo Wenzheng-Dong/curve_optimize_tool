@@ -1,0 +1,90 @@
+{
+ "git_commit": "db5b96306191483a71fd79b71186c0ca9d4f0c9e",
+ "N_export": 120,
+ "T_ns": 50.0,
+ "gate": {
+  "key": "Xpi_novera",
+  "name": "X(pi) [Novera]",
+  "theta": 3.141592653589793,
+  "phi_axis": 0.0,
+  "solve_mode": "independent",
+  "source_gate": null,
+  "fluence_floor": 0.19739208802178715
+ },
+ "device": {
+  "anharmonicity": -0.19848,
+  "rabi_max": 0.05,
+  "gate_time": 50.0,
+  "n_modes": 20,
+  "static_detuning": 0.0001,
+  "control_error": 0.02
+ },
+ "arms": {
+  "A": {
+   "name": "Gaussian",
+   "layer": "planar",
+   "csv": "waveforms/A_gaussian_120pt.csv",
+   "json": "waveforms/A_gaussian.json",
+   "run_id": null,
+   "status": null,
+   "infidelity_120pt": 0.0017454580350159121,
+   "infidelity_fine": 0.0017454591862660074,
+   "sampling_loss_ratio": 0.9999993404313866
+  },
+  "B": {
+   "name": "Gaussian + DRAG",
+   "layer": "planar_drag",
+   "csv": "waveforms/B_gaussian_drag_120pt.csv",
+   "json": "waveforms/B_gaussian_drag.json",
+   "run_id": null,
+   "status": null,
+   "infidelity_120pt": 7.452874514091157e-06,
+   "infidelity_fine": 7.454934296546867e-06,
+   "sampling_loss_ratio": 0.9997237021315313
+  },
+  "C": {
+   "name": "Optimized (3D)",
+   "layer": "general",
+   "csv": "waveforms/C_optimized_120pt.csv",
+   "json": "waveforms/C_optimized.json",
+   "run_id": "20260809_Xpi_novera_armC_accepted",
+   "status": "maxiter",
+   "infidelity_120pt": 6.275472274275273e-05,
+   "infidelity_fine": 6.567624176956333e-05,
+   "sampling_loss_ratio": 0.9555163488638516
+  },
+  "D": {
+   "name": "Opt + fluence cap",
+   "layer": "general",
+   "csv": "waveforms/D_optimized_fluence_cap_120pt.csv",
+   "json": "waveforms/D_optimized_fluence_cap.json",
+   "run_id": "20260809_Xpi_novera_armD_accepted",
+   "status": "maxiter",
+   "infidelity_120pt": 4.275621562577214e-06,
+   "infidelity_fine": 4.453708521090505e-06,
+   "sampling_loss_ratio": 0.9600137822962682
+  },
+  "E": {
+   "name": "Opt AD-exact",
+   "layer": "general",
+   "csv": "waveforms/E_optimized_ad_exact_120pt.csv",
+   "json": "waveforms/E_optimized_ad_exact.json",
+   "run_id": "20260809_Xpi_novera_armE_accepted",
+   "status": "maxiter",
+   "infidelity_120pt": 2.7691670401175372e-08,
+   "infidelity_fine": 3.057524589067384e-08,
+   "sampling_loss_ratio": 0.9056892134307242
+  },
+  "F": {
+   "name": "Opt AD-robust",
+   "layer": "general",
+   "csv": "waveforms/F_optimized_ad_robust_120pt.csv",
+   "json": "waveforms/F_optimized_ad_robust.json",
+   "run_id": "20260809_Xpi_novera_armF_accepted",
+   "status": "maxiter",
+   "infidelity_120pt": 8.166958685995596e-07,
+   "infidelity_fine": 2.626956390083812e-06,
+   "sampling_loss_ratio": 0.31089053159862434
+  }
+ }
+}
