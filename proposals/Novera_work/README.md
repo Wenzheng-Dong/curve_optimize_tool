@@ -7,6 +7,25 @@ Novera device parameters, built on the machinery the four X/Y proposals already 
 Everything below that is a number carries where it came from. Everything that is a
 judgement call is marked ★ and says what the alternative was.
 
+## Folder layout (reorganised 2026-08-09)
+
+```
+README.md                     this file
+run_novera.py                 the N2 solver driver -- ★ must stay at this depth
+novera_solve_summary.json       (it resolves REPO_ROOT as HERE.parent.parent)
+gates/
+  Novera_Xpi/  Novera_Ypi/    armlib + manifest.json + waveforms/  -- the canonical record.
+                              ★ folder names are bound in _gatelib/gatespec.py's `folder=`
+                              field; gate_dir() finds them by name anywhere under
+                              proposals/, so they may move but must not be renamed.
+notebooks/                    the three notebooks. They resolve their gate folder as
+                              Path.cwd().parent/"gates"/<name>, so run them with the
+                              kernel cwd at notebooks/ (they assert if it is not).
+delivery/                     the experimentalist-facing package -- see delivery/README.md.
+                              Derived from gates/*/waveforms/, never edited by hand.
+audits/                       audits of waveforms that came from elsewhere.
+```
+
 ---
 
 ## 0. What is reused, and what actually changes
@@ -237,8 +256,8 @@ of anything `_gatelib` already documents.
 
 ## 6. Export contract
 
-`Novera_work/<gate>/waveforms/<arm>.json` + `<arm>_120pt.csv`, written through `recorder`
-(only module allowed to touch the filesystem).
+`Novera_work/gates/<gate>/waveforms/<arm>.json` + `<arm>_120pt.csv`, written through
+`recorder` (only module allowed to touch the filesystem).
 
 ★ **Φ_vz ships with the waveform.** The solved object is a three-level polar decomposition
 `W = R_z(Φ_vz)·U_target`. Exporting (Ω_x, Ω_y) alone hands the user a pulse that is **not**
