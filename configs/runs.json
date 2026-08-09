@@ -38,5 +38,14 @@
     }
   },
   "Ypi": {},
-  "Ypi2": {}
+  "Ypi2": {},
+  "Xpi_novera": {
+    "run_ids": {
+      "C": "20260809_Xpi_novera_armC_accepted",
+      "D": "20260809_Xpi_novera_armD_accepted",
+      "E": "20260809_Xpi_novera_armE_accepted",
+      "F": "20260809_Xpi_novera_armF_accepted"
+    }
+  },
+  "Ypi_novera": {}
 }
