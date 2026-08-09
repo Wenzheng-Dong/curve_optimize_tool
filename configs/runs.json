@@ -31,8 +31,8 @@
   },
   "Xpi2": {
     "run_ids": {
-      "C": null,
-      "D": null,
+      "C": "20260808_Xpi2_armC",
+      "D": "20260808_Xpi2_armD",
       "E": null,
       "F": null
     }
