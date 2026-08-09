@@ -1,0 +1,102 @@
+{
+  "M": 20,
+  "N_grid": 300,
+  "T": 50.0,
+  "ansatz": {
+    "name": "Xpi2_armC_warm_B",
+    "source": "F06-min recipe: general layer, Gaussian+DRAG warm start, gate_level='three_level' throughout, hessian_mode='default', hard constraints = gate residual (vector, polar decomposition) + c1 endpoints + peak epigraph + R guard. No fluence cap -- the deliberately unguarded arm, kept so a new gate shows whether it reproduces the surrogate-vs-truth divergence X(pi) had."
+  },
+  "device": {
+    "anharmonicity": -0.2,
+    "control_error": 0.02,
+    "derived": {
+      "anharmonicity_rate": -1.2566370614359172,
+      "decoherence_floor": 0.0004166666666666667,
+      "delta": -1.2566370614359172,
+      "eta": 0.25,
+      "fenchel_min_time": 20.0,
+      "gamma1": 1.6666666666666667e-05,
+      "gamma_phi": 8.333333333333334e-06,
+      "peak_budget": 15.707963267948966,
+      "rabi_max_rate": 0.3141592653589793,
+      "resonant_harmonic": 20.0,
+      "resonant_harmonic_matched": true,
+      "static_detuning_rate": 0.0006283185307179586
+    },
+    "gate_time": 50.0,
+    "n_modes": 20,
+    "rabi_max": 0.05,
+    "sample_rate": 2.4,
+    "static_detuning": 0.0001,
+    "t1": 60000.0,
+    "t2_echo": 60000.0
+  },
+  "e0_cap": null,
+  "fluence_cap": null,
+  "gate_level": "three_level",
+  "git_branch": "dev/full_cost_optimizer",
+  "git_commit": "49efa0cf073785f316f88e24bebdb467bca33e3a",
+  "layer": "general",
+  "n_peak": 120,
+  "novera_git_hash": "59fb6166e105a44064b440865b8fed3415258ad9",
+  "objective": {
+    "mode": "budget",
+    "terms": [
+      "c1",
+      "c2",
+      "c3",
+      "c4"
+    ],
+    "weights": {
+      "c1": 6.579736267392905e-08,
+      "c2": 7.792727282720194e-14,
+      "c3": 0.0002666666666666667,
+      "c4": 0.3333333333333333
+    }
+  },
+  "run_id": "20260808_Xpi2_armC",
+  "schema_version": 2,
+  "solver": {
+    "checkpoint_every": 100,
+    "early_stop": null,
+    "fixed_budget_survey": false,
+    "gtol": 1e-12,
+    "hessian_mode": "default",
+    "maxiter": 6000,
+    "method": "trust-constr",
+    "xtol": 1e-14
+  },
+  "stop_reason": "converged",
+  "synthetic": false,
+  "target_gate": {
+    "matrix_imag": [
+      [
+        0.0,
+        -0.7071067811865475
+      ],
+      [
+        -0.7071067811865475,
+        0.0
+      ]
+    ],
+    "matrix_real": [
+      [
+        0.7071067811865476,
+        0.0
+      ],
+      [
+        0.0,
+        0.7071067811865476
+      ]
+    ],
+    "name": "X(pi/2)",
+    "phi_axis": 0.0,
+    "theta": 1.5707963267948966
+  },
+  "tau_guard": {
+    "bound": 0.3141592653589793,
+    "rho": 0.5
+  },
+  "timestamp": "2026-08-08T23:38:02.047586+00:00",
+  "winding_branch": 1.5707963267948966
+}

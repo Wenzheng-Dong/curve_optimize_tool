@@ -1,0 +1,21 @@
+# Byte-code / caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Gate export workspaces (regenerable from _runs/ via GateLab.export_arms)
+results/
+
+# New optimization runs land here untracked; the reference runs backing the
+# registered arms in configs/runs.json ARE tracked (committed explicitly).
+_runs/*
+!_runs/20260808_F06min_gaussian3d_construction/
+!_runs/20260810_F06b_fluence_cap2_mi20000/
+!_runs/20260810_F06e_adexact_construction_r2/
+!_runs/20260808_F06f_adrobust_construction/
+!_runs/20260810_F06e_adexact_construction/
+!_runs/20260808_Xpi2_armC/
+
+# macOS
+.DS_Store

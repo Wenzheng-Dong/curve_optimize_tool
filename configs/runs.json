@@ -1,0 +1,42 @@
+{
+  "_README": [
+    "Which recorded _runs/ directory backs which arm of which gate.",
+    "This file is DATA, not configuration you reason about: it changes every time a",
+    "solve lands, and run_construction.py writes it for you (gatespec.register_run).",
+    "Hand-editing is fine; keys must be gate keys from _gatelib/gatespec.py's SPECS",
+    "and arm keys from _gatelib/armspec.py's ARM_RECIPES.",
+    "",
+    "run_ids       : the run whose last checkpoint IS the arm.",
+    "trace_run_ids : a run kept only for its optimization trajectory (Figure 4).",
+    "                Not inherited by rotated gates -- see GateSpec.trace_run_ids.",
+    "",
+    "null / missing / a directory that does not exist  ->  that arm is simply absent",
+    "from ARM_ORDER and the notebook runs without it. A fresh gate therefore works",
+    "end-to-end on baselines A and B before any optimizer time has been spent.",
+    "",
+    "What does NOT belong here: anything with a physics justification behind it.",
+    "Device and noise parameters live in curve_opt.device; what each arm IS lives in",
+    "_gatelib/armspec.py. Those carry derivations that JSON has no room for."
+  ],
+  "Xpi": {
+    "run_ids": {
+      "C": "20260808_F06min_gaussian3d_construction",
+      "D": "20260810_F06b_fluence_cap2_mi20000",
+      "E": "20260810_F06e_adexact_construction_r2",
+      "F": "20260808_F06f_adrobust_construction"
+    },
+    "trace_run_ids": {
+      "E": "20260810_F06e_adexact_construction"
+    }
+  },
+  "Xpi2": {
+    "run_ids": {
+      "C": "20260808_Xpi2_armC",
+      "D": null,
+      "E": null,
+      "F": null
+    }
+  },
+  "Ypi": {},
+  "Ypi2": {}
+}

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "curve-opt"
+version = "0.2.0"
+description = "Device parameters + target gate in, noise-robust optimized pulse out: error-budget waveform optimization for single-qubit gates"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Wenzheng Dong", email = "wenzheng.dong@quelements.com" }]
+
+# Pinned floors match the `curve` conda env (see environment.yml).
+# No qutip: independent arbitration is carried by the committed golden baseline
+# (golden/) and the scipy-expm arbiter in tests/test_propagate.py.
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.14",
+    "jax>=0.4.38",
+    "jaxlib>=0.4.38",
+    "matplotlib>=3.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+# src layout without requiring `pip install -e .`: pytest puts src/ on sys.path.
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "slow: run takes more than ~10 s (grid-refinement / full optimization checks)",
+]

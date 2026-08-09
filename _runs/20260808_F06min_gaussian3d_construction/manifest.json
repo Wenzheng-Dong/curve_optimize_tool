@@ -1,0 +1,86 @@
+{
+  "M": 20,
+  "N_grid": 300,
+  "T": 50.0,
+  "ansatz": {
+    "name": "gaussian_drag_warm_started_3d",
+    "source": "F06-min (2026-08-08): warm-started from build_gaussian_drag()'s own kappa coefficients (M=20), c0=0, general layer, gate_level='three_level' for the whole run. Answers the single question the task brief poses: can a genuinely 3D design curve push C3 below the planar floor 6.58e-4 that DRAG cannot touch?"
+  },
+  "device": {
+    "anharmonicity": -0.2,
+    "control_error": 0.02,
+    "derived": {
+      "anharmonicity_rate": -1.2566370614359172,
+      "decoherence_floor": 0.00125,
+      "delta": -1.2566370614359172,
+      "eta": 0.25,
+      "fenchel_min_time": 20.0,
+      "gamma1": 1.6666666666666667e-05,
+      "gamma_phi": 8.333333333333334e-06,
+      "peak_budget": 15.707963267948966,
+      "rabi_max_rate": 0.3141592653589793,
+      "resonant_harmonic": 20.0,
+      "static_detuning_rate": 0.0006283185307179586
+    },
+    "gate_time": 50.0,
+    "n_modes": 20,
+    "rabi_max": 0.05,
+    "sample_rate": 2.4,
+    "static_detuning": 0.0001,
+    "t1": 60000.0,
+    "t2_echo": 60000.0
+  },
+  "gate_level": "three_level",
+  "git_branch": "feature/F06min_beat_gaussian_drag",
+  "git_commit": "ba8f4800c984f12286a79655eeb2b79792fc5492",
+  "layer": "general",
+  "n_peak": 120,
+  "novera_git_hash": "59fb6166e105a44064b440865b8fed3415258ad9",
+  "objective": {
+    "terms": [
+      "c1",
+      "c2",
+      "c3",
+      "c4"
+    ],
+    "weights": {
+      "c1": 6.579736267392905e-08,
+      "c2": 7.792727282720194e-14,
+      "c3": 0.0002666666666666667,
+      "c4": 0.3333333333333333
+    }
+  },
+  "run_id": "20260808_F06min_gaussian3d_construction",
+  "schema_version": 2,
+  "solver": {
+    "checkpoint_every": 100,
+    "early_stop": null,
+    "fixed_budget_survey": false,
+    "gtol": 1e-12,
+    "hessian_mode": "default",
+    "maxiter": 6000,
+    "method": "trust-constr",
+    "xtol": 1e-14
+  },
+  "stop_reason": "converged",
+  "synthetic": false,
+  "target_gate": {
+    "matrix": [
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ]
+    ],
+    "name": "X(pi)"
+  },
+  "tau_guard": {
+    "bound": 0.3141592653589793,
+    "rho": 0.5
+  },
+  "timestamp": "2026-08-07T15:36:20.964658+00:00",
+  "winding_branch": 3.141592653589793
+}

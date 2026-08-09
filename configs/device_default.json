@@ -1,0 +1,17 @@
+{
+  "hardware": {
+    "anharmonicity": -0.2,
+    "rabi_max": 0.05,
+    "t1": 60000.0,
+    "t2_echo": 60000.0,
+    "sample_rate": 2.4
+  },
+  "noise": {
+    "static_detuning": 0.0001,
+    "control_error": 0.02
+  },
+  "design": {
+    "gate_time": 50.0,
+    "n_modes": 20
+  }
+}
