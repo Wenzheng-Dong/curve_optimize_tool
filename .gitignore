@@ -25,8 +25,9 @@
 # macOS
 .DS_Store
 
-# Claude Code 本地权限设置（含机器相关路径）
-.claude/settings.local.json
+# Claude Code 整个目录：agent 定义（builder.md / leader.md）成段复述了协作纪律
+# 与计划文档的章节结构，跟上面那组同类；settings.local.json 还含机器相关路径。
+/.claude/
 
 # Python 构建 / 缓存产物
 __pycache__/
@@ -40,9 +41,6 @@ dist/
 # 环境
 .venv/
 venv/
-
-# agent worktrees (transient, not part of the repo)
-.claude/worktrees/
 
 # stray scratch dir, not part of this repo
 #proposals/
