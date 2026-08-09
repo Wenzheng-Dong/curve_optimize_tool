@@ -24,7 +24,8 @@ control it lands on?**
 
 Early development. Planning is complete; the numerical foundations
 (planar and 3D feasibility, quadrature order, propagator ordering, Gauss-Newton
-speedup) are validated. See `_dev_logs/ROADMAP.md` for per-step status.
+speedup) are validated. Per-step status is tracked in a development log that is
+kept out of this repository.
 
 All results are currently **proxy-layer** statements: they concern the geometric
 robustness conditions in the quasi-static limit, not a full physical-model
